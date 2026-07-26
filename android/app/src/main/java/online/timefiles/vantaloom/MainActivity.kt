@@ -246,6 +246,40 @@ class MainActivity : Activity() {
                 loadBundledApp()
             }
         }
+
+        // 冷启动路径：通知把被杀的应用拉起来时，Intent 就在这里。
+        handleNotificationIntent(intent)
+    }
+
+    /**
+     * 通知点击（0.15.14）。launchMode=singleTask ⇒ 应用已在跑时点击走这里。
+     */
+    override fun onNewIntent(newIntent: Intent?) {
+        super.onNewIntent(newIntent)
+        if (newIntent != null) intent = newIntent
+        handleNotificationIntent(newIntent)
+    }
+
+    /**
+     * 把「点了哪条通知」交给前端：写进桥的单槽（冷启动时前端还没挂载，靠它补
+     * 位）并立刻广播一次事件（热路径，前端已在跑）。extras 读完就删——配置变更
+     * 重建 Activity 时同一个 Intent 会再来一遍，不清就会重复跳转。
+     */
+    private fun handleNotificationIntent(source: Intent?) {
+        val conversationId = source
+            ?.getStringExtra(RuntimeNotifications.EXTRA_CONVERSATION_ID)
+            ?.trim()
+            .orEmpty()
+        if (conversationId.isEmpty()) return
+        val machineId = source
+            ?.getStringExtra(RuntimeNotifications.EXTRA_MACHINE_ID)
+            ?.trim()
+            .orEmpty()
+        source?.removeExtra(RuntimeNotifications.EXTRA_CONVERSATION_ID)
+        source?.removeExtra(RuntimeNotifications.EXTRA_MACHINE_ID)
+        if (::bridge.isInitialized) {
+            bridge.setNotificationTarget(conversationId, machineId)
+        }
     }
 
     private fun loadBundledApp() {
@@ -781,7 +815,8 @@ class MainActivity : Activity() {
     },
     requestIgnoreBatteryOptimizations: function (callbackId) {
       N.requestIgnoreBatteryOptimizations(__loomSecret, callbackId);
-    }
+    },
+    notificationTarget: function () { return N.notificationTarget(); }
   };
 })();
 """.trimIndent()

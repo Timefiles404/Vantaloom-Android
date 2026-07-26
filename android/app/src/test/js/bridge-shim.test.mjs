@@ -92,6 +92,7 @@ window.__loomNative = {
     calls.authorize.push({ original, requestTarget, signed, signature })
     return signed
   },
+  notificationTarget: () => '{"conversationId":"conv-x"}',
   restoreLocalRuntimeAuth(secret) {
     calls.restore += 1
     calls.restoreSecret = secret
@@ -200,5 +201,11 @@ const helperDescriptor = Object.getOwnPropertyDescriptor(
 assert.equal(helperDescriptor?.configurable, false)
 assert.equal(helperDescriptor?.writable, false)
 assert.deepEqual(calls.open, ["https://example.com/preview"])
+// Notification tap target: ungated passthrough (a conversation id the runtime
+// itself just emitted — no capability, no secret).
+assert.equal(
+  window.__loomBridge.notificationTarget(),
+  '{"conversationId":"conv-x"}'
+)
 
 console.log("bridge shim harness passed")

@@ -390,6 +390,37 @@ class LoomJsBridge(
         }
     }
 
+    // ---- Notification tap target (0.15.14) ----
+
+    /**
+     * 「用户点了哪条通知」的单槽。MainActivity 在 onCreate/onNewIntent 里写入，
+     * 前端 drain 走。同时立刻广播一次事件：应用已在跑时前端能立即跳转，冷启动
+     * 时事件必然先于前端挂载丢失——所以槽必须存在，两条路缺一不可。
+     *
+     * 非特权（只是一个会话 id，且是运行时自己刚发出去的），不走 secret 门。
+     */
+    @Volatile private var pendingNotificationTarget: String? = null
+
+    fun setNotificationTarget(conversationId: String, machineId: String) {
+        if (conversationId.isBlank()) return
+        val payload = JSONObject().put("conversationId", conversationId)
+        if (machineId.isNotBlank()) payload.put("machineId", machineId)
+        val json = payload.toString()
+        pendingNotificationTarget = json
+        evalJs(
+            "window.dispatchEvent(new CustomEvent('vantaloom:notification-jump'," +
+                "{detail:$json}))",
+        )
+    }
+
+    /** 取走待处理的通知点击目标（取走即清）；无则空串。 */
+    @JavascriptInterface
+    fun notificationTarget(): String {
+        val target = pendingNotificationTarget
+        pendingNotificationTarget = null
+        return target ?: ""
+    }
+
     // ---- Background persistence ----
 
     /** Keep-alive / wake-lock / boot-autostart flags + battery-optimization state; sync. */
