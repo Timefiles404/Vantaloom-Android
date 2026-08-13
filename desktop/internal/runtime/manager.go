@@ -38,9 +38,9 @@ const (
 	// (which may differ if 8780 was taken) is recorded in runtime/api.port.
 	DefaultAPIPort = 8780
 
+	// Runtime packages live on npmjs.org; the shell resolves "latest" there and
+	// downloads the platform tarball. There is no GitHub-release channel.
 	defaultRegistry = "https://registry.npmjs.org"
-	defaultRepo     = "Timefiles404/Vantaloom-next"
-	defaultRelease  = "runtime-latest"
 
 	healthTimeout = 2 * time.Second
 )
@@ -536,12 +536,6 @@ func (m *Manager) writeConfig(res resolved) {
 	cfg["runtimePackage"] = RuntimePackageName()
 	cfg["runtimeVersion"] = "latest"
 	cfg["npmRegistry"] = m.Registry
-	if _, ok := cfg["repo"]; !ok {
-		cfg["repo"] = defaultRepo
-	}
-	if _, ok := cfg["releaseTag"]; !ok {
-		cfg["releaseTag"] = defaultRelease
-	}
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return

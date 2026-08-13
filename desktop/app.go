@@ -4,9 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,12 +48,17 @@ type App struct {
 	// startCtl). Zero port = the ctl server failed to start.
 	ctlPort  int
 	ctlToken string
+
+	// route 非空 = 副窗口模式（--route，已通过 validateSubWindowRoute 校验）：
+	// Bootstrap 跳过安装/更新编排，只等待运行时可达后加载该站内路由。
+	route string
 }
 
 // NewApp builds the App with a runtime Manager bound to the default install
 // prefix (overridable by VANTALOOM_HOME) and the public npm registry.
-func NewApp() *App {
-	return &App{mgr: rt.New("", "")}
+// route 非空时进入副窗口模式（见 window_route.go）。
+func NewApp(route string) *App {
+	return &App{mgr: rt.New("", ""), route: route}
 }
 
 // startup is wired to Wails OnStartup; it captures the runtime context used for
@@ -120,6 +129,59 @@ func (a *App) startCtl() {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
+	// /open-window 拉起一个新的壳进程实例作为副窗口（如 IDE 独立窗口）。
+	// POST body {"route":"/ide/?machine=…"}；route 只允许站内相对路径（与
+	// --route 同一套白名单校验，见 window_route.go）。成功 200 {"ok":true}，
+	// 失败 4xx/5xx {"ok":false,"error":"中文原因"}。新进程与本进程互相独立。
+	mux.HandleFunc("/open-window", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		// fetch 带 application/json 时浏览器会先发 CORS 预检；预检无副作用，
+		// 直接放行（真正的调用仍需 token）。
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		writeJSON := func(status int, ok bool, errMsg string) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			payload := map[string]any{"ok": ok}
+			if errMsg != "" {
+				payload["error"] = errMsg
+			}
+			_ = json.NewEncoder(w).Encode(payload)
+		}
+		if r.URL.Query().Get("t") != token {
+			writeJSON(http.StatusForbidden, false, "口令校验失败")
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeJSON(http.StatusMethodNotAllowed, false, "仅支持 POST")
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 8192))
+		if err != nil {
+			writeJSON(http.StatusBadRequest, false, "读取请求体失败")
+			return
+		}
+		var req struct {
+			Route string `json:"route"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeJSON(http.StatusBadRequest, false, `请求体必须是 {"route":"…"} 形式的 JSON`)
+			return
+		}
+		if _, err := validateSubWindowRoute(req.Route); err != nil {
+			writeJSON(http.StatusBadRequest, false, err.Error())
+			return
+		}
+		if err := spawnSubWindow(req.Route); err != nil {
+			writeJSON(http.StatusInternalServerError, false, err.Error())
+			return
+		}
+		writeJSON(http.StatusOK, true, "")
+	})
 	// /capture lets the in-app 截图 button work again (its old window.go path
 	// was dead on the external origin for the same injection reason).
 	mux.HandleFunc("/capture", func(w http.ResponseWriter, r *http.Request) {
@@ -140,16 +202,32 @@ func (a *App) startCtl() {
 	a.ctlPort = ln.Addr().(*net.TCPAddr).Port
 	a.ctlToken = token
 	go func() { _ = http.Serve(ln, mux) }()
+
+	// 调试钩子（默认关闭）：设置 VANTALOOM_CTL_INFO_FILE 时把本进程的 ctl
+	// 端口与 token 写入该文件，供外部 e2e 测试驱动窗控端点。能给本进程设
+	// 环境变量的人与进程本就同一信任域，不扩大攻击面。
+	if p := os.Getenv("VANTALOOM_CTL_INFO_FILE"); p != "" {
+		_ = os.WriteFile(p, []byte(fmt.Sprintf(`{"pid":%d,"port":%d,"token":"%s"}`+"\n", os.Getpid(), a.ctlPort, a.ctlToken)), 0o600)
+	}
 }
 
 // appURL is the URL the webview loads after Bootstrap: the local app plus the
-// desktop-shell markers the in-app title bar detects.
+// desktop-shell markers the in-app title bar detects. 副窗口模式下目标是
+// <基址><route>；route 可能自带查询串（如 /ide/?machine=…），此时壳参数必须
+// 用 & 续接而不是再来一个 ?。
 func (a *App) appURL() string {
-	base := a.mgr.BackendURL()
-	if a.ctlPort == 0 {
-		return base + "?vtlshell=1"
+	target := a.mgr.BackendURL()
+	if a.route != "" {
+		target = strings.TrimSuffix(target, "/") + a.route
 	}
-	return fmt.Sprintf("%s?vtlshell=1&vtlport=%d&vtltoken=%s", base, a.ctlPort, a.ctlToken)
+	sep := "?"
+	if strings.Contains(target, "?") {
+		sep = "&"
+	}
+	if a.ctlPort == 0 {
+		return target + sep + "vtlshell=1"
+	}
+	return fmt.Sprintf("%s%svtlshell=1&vtlport=%d&vtltoken=%s", target, sep, a.ctlPort, a.ctlToken)
 }
 
 // GetStatus returns the current install/run snapshot (for diagnostics in the UI).
@@ -187,6 +265,12 @@ func (a *App) CaptureWebview() (string, error) {
 // cleanup (see rt.Manager.uninstallLegacyMeshOnce), which self-gates behind a
 // done-marker and never blocks on a declined elevation prompt.
 func (a *App) Bootstrap() (string, error) {
+	// 副窗口（--route）走独立启动路径：主窗口已负责安装/更新/启动编排，这里
+	// 只等待运行时可达 —— 两个进程绝不并发写安装目录。
+	if a.route != "" {
+		return a.bootstrapSubWindow()
+	}
+
 	emit := func(phase, msg string, pct int) {
 		wruntime.EventsEmit(a.ctx, bootEvent, rt.Progress{Phase: phase, Message: msg, Percent: pct})
 	}
@@ -302,6 +386,40 @@ func (a *App) Bootstrap() (string, error) {
 	}
 
 	// Record the running version for the health monitor.
+	if v, ok := a.mgr.Health(a.ctx); ok {
+		a.lastVersion = v
+	}
+
+	emit("ready", "就绪", 100)
+	url := a.appURL()
+	a.startMonitor()
+	return url, nil
+}
+
+// bootstrapSubWindow 是副窗口（--route）的启动路径：完全跳过 Node 检测与
+// 运行时的安装/更新/启动编排（那些是主窗口的职责），只探测运行时是否可达，
+// 可达即加载 <基址><route>。等待超时返回明确的中文错误 —— splash 会显示错误
+// 与「重试」按钮，不会静默转圈。
+func (a *App) bootstrapSubWindow() (string, error) {
+	emit := func(phase, msg string, pct int) {
+		wruntime.EventsEmit(a.ctx, bootEvent, rt.Progress{Phase: phase, Message: msg, Percent: pct})
+	}
+
+	ctx, cancel := context.WithTimeout(a.ctx, 60*time.Second)
+	defer cancel()
+
+	emit("check", "正在检测本地运行时…", 5)
+	st := a.mgr.Status(ctx)
+	if !st.Running && !st.Installed {
+		return "", fmt.Errorf("未检测到本地运行时：请先打开 Vantaloom 主窗口完成安装并启动服务，再打开此窗口")
+	}
+
+	emit("wait", "正在等待后端服务就绪…", 40)
+	if err := a.mgr.WaitHealthy(ctx, 45*time.Second); err != nil {
+		return "", fmt.Errorf("后端服务未就绪（等待超时）：请确认 Vantaloom 主窗口或本地运行时已启动，然后点击重试")
+	}
+
+	// 记录运行版本，供健康监视器在后端更新重启后自动刷新页面。
 	if v, ok := a.mgr.Health(a.ctx); ok {
 		a.lastVersion = v
 	}

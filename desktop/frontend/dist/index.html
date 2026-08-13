@@ -705,9 +705,18 @@
 
       $("retry").addEventListener("click", boot);
       $("browser").addEventListener("click", () => {
-        // Strip the desktop-shell markers — a plain browser must not render
-        // the in-app title bar.
-        if (targetURL && window.go?.main) window.go.main.App.OpenInBrowser(targetURL.split("?")[0]);
+        // 只剥壳标记参数（vtlshell/vtlport/vtltoken）—— 普通浏览器不该渲染
+        // 应用内标题栏；route 自带的查询串（如 /ide/?machine=…）必须保留。
+        if (!targetURL || !window.go?.main) return;
+        let u = targetURL;
+        try {
+          const parsed = new URL(targetURL);
+          ["vtlshell", "vtlport", "vtltoken"].forEach((k) => parsed.searchParams.delete(k));
+          u = parsed.toString();
+        } catch (_) {
+          u = targetURL.split("?")[0];
+        }
+        window.go.main.App.OpenInBrowser(u);
       });
       $("logToggle").addEventListener("click", () => {
         const open = logEl.classList.toggle("show");

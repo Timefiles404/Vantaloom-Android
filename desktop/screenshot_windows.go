@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"image"
 	"image/png"
+	"os"
+	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -23,12 +25,15 @@ var (
 	user32 = syscall.NewLazyDLL("user32.dll")
 	gdi32  = syscall.NewLazyDLL("gdi32.dll")
 
-	procFindWindowW         = user32.NewProc("FindWindowW")
-	procGetForegroundWindow = user32.NewProc("GetForegroundWindow")
-	procGetClientRect       = user32.NewProc("GetClientRect")
-	procClientToScreen      = user32.NewProc("ClientToScreen")
-	procGetDC               = user32.NewProc("GetDC")
-	procReleaseDC           = user32.NewProc("ReleaseDC")
+	procFindWindowW              = user32.NewProc("FindWindowW")
+	procGetForegroundWindow      = user32.NewProc("GetForegroundWindow")
+	procGetClientRect            = user32.NewProc("GetClientRect")
+	procClientToScreen           = user32.NewProc("ClientToScreen")
+	procGetDC                    = user32.NewProc("GetDC")
+	procReleaseDC                = user32.NewProc("ReleaseDC")
+	procEnumWindows              = user32.NewProc("EnumWindows")
+	procGetWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
+	procIsWindowVisible          = user32.NewProc("IsWindowVisible")
 
 	procCreateCompatibleDC     = gdi32.NewProc("CreateCompatibleDC")
 	procCreateCompatibleBitmap = gdi32.NewProc("CreateCompatibleBitmap")
@@ -62,13 +67,48 @@ const (
 	biRGB        = 0
 )
 
-// findMainWindow locates the Wails window by its title ("Vantaloom", set in
-// main.go), falling back to the foreground window (the app is foreground for a
-// user-initiated capture).
+// enumOwnMu/enumOwnHwnd 承接 EnumWindows 回调的结果。不经 lparam 传 Go 指针
+// （vet 的 unsafe.Pointer 规则不放行），改用互斥量保护的包级变量：EnumWindows
+// 是同步调用，持锁期间回调写、调用方读，多个 ctl 请求并发也安全。
+var (
+	enumOwnMu   sync.Mutex
+	enumOwnHwnd uintptr
+)
+
+// enumOwnWindow 是 EnumWindows 的回调：命中属于当前进程的第一个可见顶层窗口
+// 即记录并停止枚举。syscall.NewCallback 的 trampoline 是进程级稀缺资源，
+// 必须只创建一次（包级变量）。
+var enumOwnWindow = syscall.NewCallback(func(hwnd uintptr, lparam uintptr) uintptr {
+	var pid uint32
+	procGetWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&pid)))
+	if pid != uint32(os.Getpid()) {
+		return 1 // 继续枚举
+	}
+	if vis, _, _ := procIsWindowVisible.Call(hwnd); vis == 0 {
+		return 1 // 跳过本进程的隐藏辅助窗口（IME/OLE 消息窗等）
+	}
+	enumOwnHwnd = hwnd
+	return 0 // 命中，停止枚举
+})
+
+// findMainWindow 定位「本进程自己的」Wails 窗口。
+//
+// 多实例（IDE 副窗口 = 独立壳进程，见 window_route.go）下绝不能按标题
+// FindWindow：主窗口与副窗口标题不同（"Vantaloom" / "Vantaloom IDE"），按
+// 标题查找会命中别的进程的窗口，导致拖拽/调节/截图作用在错误的窗口上。
+// 因此改为按 PID 枚举可见顶层窗口；旧的标题查找与前台窗口仅作兜底。
 func findMainWindow() uintptr {
+	enumOwnMu.Lock()
+	enumOwnHwnd = 0
+	procEnumWindows.Call(enumOwnWindow, 0)
+	hwnd := enumOwnHwnd
+	enumOwnMu.Unlock()
+	if hwnd != 0 {
+		return hwnd
+	}
 	if title, err := syscall.UTF16PtrFromString("Vantaloom"); err == nil {
-		if hwnd, _, _ := procFindWindowW.Call(0, uintptr(unsafe.Pointer(title))); hwnd != 0 {
-			return hwnd
+		if h, _, _ := procFindWindowW.Call(0, uintptr(unsafe.Pointer(title))); h != 0 {
+			return h
 		}
 	}
 	fg, _, _ := procGetForegroundWindow.Call()
