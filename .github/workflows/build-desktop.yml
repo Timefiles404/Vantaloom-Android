@@ -51,12 +51,29 @@ jobs:
         run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
 
       # ── Windows: NSIS installer (+ portable zip) ──
+      # GitHub 的 windows 运行器镜像通常自带 NSIS：先用现成的，缺了才装。
+      # choco 用 1641/3010 表示「装好了但需要重启」，在 CI 里等同成功；原来
+      # 直接把 choco 的退出码当成败，首次真跑就挂在这一步（2026-08-14）。
       - name: Install NSIS
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install nsis -y --no-progress
-          echo "C:\Program Files (x86)\NSIS" >> $env:GITHUB_PATH
+          $nsisDir = "C:\Program Files (x86)\NSIS"
+          $have = (Get-Command makensis -ErrorAction SilentlyContinue) -or (Test-Path "$nsisDir\makensis.exe")
+          if (-not $have) {
+            choco install nsis -y --no-progress
+            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1641 -and $LASTEXITCODE -ne 3010) {
+              throw "choco install nsis 失败：退出码 $LASTEXITCODE"
+            }
+          }
+          if (Test-Path "$nsisDir\makensis.exe") {
+            echo $nsisDir >> $env:GITHUB_PATH
+            & "$nsisDir\makensis.exe" /VERSION
+          } elseif (Get-Command makensis -ErrorAction SilentlyContinue) {
+            makensis /VERSION
+          } else {
+            throw "NSIS 不可用：既没有预装也没能安装成功"
+          }
 
       - name: Build Windows installer
         if: runner.os == 'Windows'
