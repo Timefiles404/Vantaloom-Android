@@ -40,8 +40,8 @@ jobs:
       # https://packages.termux.dev/apt/termux-main/pool/main/p/proot/ , download,
       # sha256sum, verify the data.tar layout still has bin/proot + libexec/proot/
       # loader{,32}, then update BOTH values below.
-      PROOT_DEB_URL: "https://packages.termux.dev/apt/termux-main/pool/main/p/proot/proot_5.1.107.89_aarch64.deb"
-      PROOT_DEB_SHA256: "ec9fe38c50cfd49dd31fe360ffbcc3124a945dc1ea16293a8a769303dd724f46"
+      PROOT_DEB_URL: "https://packages.termux.dev/apt/termux-main/pool/main/p/proot/proot_5.1.107.90_aarch64.deb"
+      PROOT_DEB_SHA256: "6d0d1758d3df22f845f3363ea7dad0088664b6607d13bbeac7d9e55aeab36261"
       TALLOC_DEB_URL: "https://packages.termux.dev/apt/termux-main/pool/main/libt/libtalloc/libtalloc_2.4.3_aarch64.deb"
       TALLOC_DEB_SHA256: "ac81ad623d74c209718b9f3acb2dd702cc8a88c431e820d212229910b4db29da"
       SHMEM_DEB_URL: "https://packages.termux.dev/apt/termux-main/pool/main/liba/libandroid-shmem/libandroid-shmem_0.7_aarch64.deb"
