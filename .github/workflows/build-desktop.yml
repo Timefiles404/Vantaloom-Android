@@ -51,38 +51,62 @@ jobs:
         run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
 
       # ── Windows: NSIS installer (+ portable zip) ──
-      # GitHub 的 windows 运行器镜像通常自带 NSIS：先用现成的，缺了才装。
-      # choco 用 1641/3010 表示「装好了但需要重启」，在 CI 里等同成功；原来
-      # 直接把 choco 的退出码当成败，首次真跑就挂在这一步（2026-08-14）。
-      - name: Install NSIS
+      # NSIS 只用来产**安装包**；产不出来时便携 zip 照常发（release 作业本来
+      # 就按「找得到才收」处理）。2026-08-14：windows-latest 上这一步连挂两次
+      # （先是无条件 choco、再是「缺了才装」），日志需要鉴权拿不到——新镜像
+      # 很可能已经不带 Chocolatey 了。与其继续盲猜，不如把它降级为尽力而为：
+      # 逐个渠道找/装，找不到就发警告并只出便携 zip，绝不再卡住整条发布链。
+      - name: Install NSIS (best effort)
+        id: nsis
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $nsisDir = "C:\Program Files (x86)\NSIS"
-          $have = (Get-Command makensis -ErrorAction SilentlyContinue) -or (Test-Path "$nsisDir\makensis.exe")
-          if (-not $have) {
-            choco install nsis -y --no-progress
-            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1641 -and $LASTEXITCODE -ne 3010) {
-              throw "choco install nsis 失败：退出码 $LASTEXITCODE"
+          function Find-MakeNsis {
+            $cmd = Get-Command makensis -ErrorAction SilentlyContinue
+            if ($cmd) { return $cmd.Source }
+            foreach ($dir in @("C:\Program Files (x86)\NSIS", "C:\Program Files\NSIS", "$env:ChocolateyInstall\bin")) {
+              if ($dir -and (Test-Path "$dir\makensis.exe")) { return "$dir\makensis.exe" }
+            }
+            return $null
+          }
+          $found = Find-MakeNsis
+          if (-not $found) {
+            if (Get-Command choco -ErrorAction SilentlyContinue) {
+              Write-Host "尝试 choco install nsis"
+              choco install nsis -y --no-progress
+              Write-Host "choco 退出码: $LASTEXITCODE"
+              $found = Find-MakeNsis
+            } else {
+              Write-Host "运行器上没有 choco"
             }
           }
-          if (Test-Path "$nsisDir\makensis.exe") {
-            echo $nsisDir >> $env:GITHUB_PATH
-            & "$nsisDir\makensis.exe" /VERSION
-          } elseif (Get-Command makensis -ErrorAction SilentlyContinue) {
-            makensis /VERSION
+          if (-not $found -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+            Write-Host "尝试 winget install NSIS.NSIS"
+            winget install --id NSIS.NSIS -e --accept-source-agreements --accept-package-agreements --disable-interactivity
+            Write-Host "winget 退出码: $LASTEXITCODE"
+            $found = Find-MakeNsis
+          }
+          if ($found) {
+            $dir = Split-Path $found
+            echo $dir >> $env:GITHUB_PATH
+            & $found /VERSION
+            "available=true" >> $env:GITHUB_OUTPUT
           } else {
-            throw "NSIS 不可用：既没有预装也没能安装成功"
+            Write-Host "::warning::NSIS 不可用，本次 Windows 产物只有便携 zip（无安装包）"
+            "available=false" >> $env:GITHUB_OUTPUT
           }
 
       - name: Build Windows installer
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          wails build -platform windows/amd64 -nsis -clean
-          if (Test-Path build/bin/Vantaloom.exe) {
-            Compress-Archive -Path build/bin/Vantaloom.exe -DestinationPath build/bin/Vantaloom-windows-amd64-portable.zip -Force
+          if ("${{ steps.nsis.outputs.available }}" -eq "true") {
+            wails build -platform windows/amd64 -nsis -clean
+          } else {
+            wails build -platform windows/amd64 -clean
           }
+          if (-not (Test-Path build/bin/Vantaloom.exe)) { throw "wails build 没有产出 Vantaloom.exe" }
+          Compress-Archive -Path build/bin/Vantaloom.exe -DestinationPath build/bin/Vantaloom-windows-amd64-portable.zip -Force
           Get-ChildItem build/bin
 
       # ── macOS: universal .app → ad-hoc-signed DMG ──
