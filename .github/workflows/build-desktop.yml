@@ -50,61 +50,15 @@ jobs:
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
 
-      # ── Windows: NSIS installer (+ portable zip) ──
-      # NSIS 只用来产**安装包**；产不出来时便携 zip 照常发（release 作业本来
-      # 就按「找得到才收」处理）。2026-08-14：windows-latest 上这一步连挂两次
-      # （先是无条件 choco、再是「缺了才装」），日志需要鉴权拿不到——新镜像
-      # 很可能已经不带 Chocolatey 了。与其继续盲猜，不如把它降级为尽力而为：
-      # 逐个渠道找/装，找不到就发警告并只出便携 zip，绝不再卡住整条发布链。
-      - name: Install NSIS (best effort)
-        id: nsis
+      # ── Windows: portable zip only ──
+      # 壳就是一个单文件 exe，NSIS 安装包做的事情也不过是把它释放到某个目录，
+      # 却要在 CI 上额外依赖一条外部工具链（2026-08-14 首次真跑连挂两次都挂在
+      # 装 NSIS 上，日志还要鉴权才看得到）。产品决定：Windows 只发便携 zip。
+      - name: Build Windows portable
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          function Find-MakeNsis {
-            $cmd = Get-Command makensis -ErrorAction SilentlyContinue
-            if ($cmd) { return $cmd.Source }
-            foreach ($dir in @("C:\Program Files (x86)\NSIS", "C:\Program Files\NSIS", "$env:ChocolateyInstall\bin")) {
-              if ($dir -and (Test-Path "$dir\makensis.exe")) { return "$dir\makensis.exe" }
-            }
-            return $null
-          }
-          $found = Find-MakeNsis
-          if (-not $found) {
-            if (Get-Command choco -ErrorAction SilentlyContinue) {
-              Write-Host "尝试 choco install nsis"
-              choco install nsis -y --no-progress
-              Write-Host "choco 退出码: $LASTEXITCODE"
-              $found = Find-MakeNsis
-            } else {
-              Write-Host "运行器上没有 choco"
-            }
-          }
-          if (-not $found -and (Get-Command winget -ErrorAction SilentlyContinue)) {
-            Write-Host "尝试 winget install NSIS.NSIS"
-            winget install --id NSIS.NSIS -e --accept-source-agreements --accept-package-agreements --disable-interactivity
-            Write-Host "winget 退出码: $LASTEXITCODE"
-            $found = Find-MakeNsis
-          }
-          if ($found) {
-            $dir = Split-Path $found
-            echo $dir >> $env:GITHUB_PATH
-            & $found /VERSION
-            "available=true" >> $env:GITHUB_OUTPUT
-          } else {
-            Write-Host "::warning::NSIS 不可用，本次 Windows 产物只有便携 zip（无安装包）"
-            "available=false" >> $env:GITHUB_OUTPUT
-          }
-
-      - name: Build Windows installer
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          if ("${{ steps.nsis.outputs.available }}" -eq "true") {
-            wails build -platform windows/amd64 -nsis -clean
-          } else {
-            wails build -platform windows/amd64 -clean
-          }
+          wails build -platform windows/amd64 -clean
           if (-not (Test-Path build/bin/Vantaloom.exe)) { throw "wails build 没有产出 Vantaloom.exe" }
           Compress-Archive -Path build/bin/Vantaloom.exe -DestinationPath build/bin/Vantaloom-windows-amd64-portable.zip -Force
           Get-ChildItem build/bin
@@ -127,7 +81,6 @@ jobs:
         with:
           name: desktop-${{ matrix.name }}
           path: |
-            desktop/build/bin/*-installer.exe
             desktop/build/bin/*-portable.zip
             desktop/build/bin/*.dmg
           if-no-files-found: error
@@ -153,10 +106,8 @@ jobs:
           SHA="$(git rev-parse --short HEAD)"
           # Stamp build number + commit into each filename so every build is a
           # distinct, permanent download.
-          WIN_SETUP="$(find artifacts -name '*-installer.exe' | head -n1 || true)"
           WIN_ZIP="$(find artifacts -name '*-portable.zip' | head -n1 || true)"
           MAC_DMG="$(find artifacts -name '*.dmg' | head -n1 || true)"
-          if [ -n "$WIN_SETUP" ]; then cp "$WIN_SETUP" "dist/Vantaloom-windows-amd64-setup-build${GITHUB_RUN_NUMBER}-${SHA}.exe"; fi
           if [ -n "$WIN_ZIP" ];   then cp "$WIN_ZIP"   "dist/Vantaloom-windows-amd64-portable-build${GITHUB_RUN_NUMBER}-${SHA}.zip"; fi
           if [ -n "$MAC_DMG" ];   then cp "$MAC_DMG"   "dist/Vantaloom-macos-universal-build${GITHUB_RUN_NUMBER}-${SHA}.dmg"; fi
           echo "SHA=$SHA" >> "$GITHUB_ENV"
@@ -170,7 +121,7 @@ jobs:
           echo '' >> notes.md
           echo '本壳只负责：检测本机 Vantaloom 安装状态 → 没安装自动安装核心后端 → 有更新自动更新 → 没启动自动启动，并封装本地 Web 应用。后端核心通过 npm 自动安装/更新。' >> notes.md
           echo '' >> notes.md
-          echo '- Windows：运行 `*-setup-*.exe` 安装（或解压 `*-portable.zip` 直接运行）。未做代码签名，SmartScreen 可能提示，选择"更多信息 → 仍要运行"。' >> notes.md
+          echo '- Windows：解压 `*-portable.zip`，直接运行里面的 `Vantaloom.exe`（免安装，放哪都行）。未做代码签名，SmartScreen 可能提示，选择"更多信息 → 仍要运行"。' >> notes.md
           echo '- macOS：打开 DMG，将 Vantaloom 拖入"应用程序"。未做公证，首次启动请右键 → 打开（或执行 `xattr -dr com.apple.quarantine /Applications/Vantaloom.app`）。' >> notes.md
           cat notes.md
 
