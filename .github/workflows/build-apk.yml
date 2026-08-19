@@ -40,8 +40,12 @@ jobs:
       # https://packages.termux.dev/apt/termux-main/pool/main/p/proot/ , download,
       # sha256sum, verify the data.tar layout still has bin/proot + libexec/proot/
       # loader{,32}, then update BOTH values below.
-      PROOT_DEB_URL: "https://packages.termux.dev/apt/termux-main/pool/main/p/proot/proot_5.1.107.90_aarch64.deb"
-      PROOT_DEB_SHA256: "6d0d1758d3df22f845f3363ea7dad0088664b6607d13bbeac7d9e55aeab36261"
+      # ⚠️ Termux 的 pool **每个包只保留最新一版**，所以这些钉子平均几周就会 404
+      # （5.1.107.85 -> .86 -> .90 -> .91 已经咬过四次）。下面的 fetch_deb 会在钉子
+      # 取不到时退到仓库自己的 Packages 索引，用**索引里的 SHA256** 校验后继续，
+      # 并打一条 ::warning:: 报出新版本号——看到告警就回来把钉子刷新一次。
+      PROOT_DEB_URL: "https://packages.termux.dev/apt/termux-main/pool/main/p/proot/proot_5.1.107.91_aarch64.deb"
+      PROOT_DEB_SHA256: "1ad09f7ddf65f297a7b59a398cd1f23a48748b1144b225f0c1e2d9f447ef3efc"
       TALLOC_DEB_URL: "https://packages.termux.dev/apt/termux-main/pool/main/libt/libtalloc/libtalloc_2.4.3_aarch64.deb"
       TALLOC_DEB_SHA256: "ac81ad623d74c209718b9f3acb2dd702cc8a88c431e820d212229910b4db29da"
       SHMEM_DEB_URL: "https://packages.termux.dev/apt/termux-main/pool/main/liba/libandroid-shmem/libandroid-shmem_0.7_aarch64.deb"
@@ -105,10 +109,53 @@ jobs:
           WORK="$RUNNER_TEMP/proot-stage"
           mkdir -p "$WORK"
 
+          TERMUX_INDEX_URL="https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages"
+          TERMUX_POOL_BASE="https://packages.termux.dev/apt/termux-main"
+          # 索引落到固定路径而不是变量缓存：resolve_from_index 的调用点是
+          # `line="$(resolve_from_index ...)"`，命令替换是**子 shell**，函数里给
+          # 变量赋的值传不回来 —— 用变量缓存等于每个包都重下一遍索引（实测）。
+          TERMUX_INDEX="$RUNNER_TEMP/termux-Packages"
+
+          # resolve_from_index <包名> -> "<pool 相对路径> <sha256> <版本>"
+          # Termux 的 Packages 索引就是 apt 自己用的那份，带每个包的 SHA256。
+          resolve_from_index() {
+            local pkg="$1"
+            [ -s "$TERMUX_INDEX" ] || curl -fsSL --retry 3 --retry-delay 2 -o "$TERMUX_INDEX" "$TERMUX_INDEX_URL"
+            awk -v pkg="$pkg" '
+              { sub(/\r$/, "") }
+              $0 == "Package: " pkg { inpkg = 1; next }
+              inpkg && /^Version: /  { ver = $2 }
+              inpkg && /^Filename: / { fn  = $2 }
+              inpkg && /^SHA256: /   { sha = $2 }
+              # ⚠️ awk 的 exit **会跑 END 块**——END 不看 done 标志就会把同一行打两遍，
+              #    调用方 cut 出来的就是两行，URL 当场拼坏（本地实测过）。
+              inpkg && /^$/ { if (fn != "" && sha != "") { print fn, sha, ver; done = 1 } exit }
+              END { if (!done && inpkg && fn != "" && sha != "") print fn, sha, ver }
+            ' "$TERMUX_INDEX"
+          }
+
+          # 先走钉死的 URL+SHA（可复现路径）；取不到就退到索引，**仍然校验**
+          # （用索引给出的 SHA256），绝不是跳过校验。
           fetch_deb() {
-            local url="$1" sha="$2" out="$3"
-            curl -fsSL --retry 3 --retry-delay 2 -o "$out" "$url"
-            echo "$sha  $out" | sha256sum -c -
+            local pkg="$1" url="$2" sha="$3" out="$4"
+            if curl -fsSL --retry 3 --retry-delay 2 -o "$out" "$url" 2>/dev/null \
+               && echo "$sha  $out" | sha256sum -c - >/dev/null 2>&1; then
+              echo "· $pkg: 钉死版本 OK ($url)"
+              return 0
+            fi
+            echo "::warning::$pkg 的钉死版本取不到或校验不过（Termux pool 只保留最新一版）；改用索引里的当前版本继续，请回 workflow 刷新 URL/SHA 钉子。"
+            local line fn isha iver
+            line="$(resolve_from_index "$pkg")"
+            if [ -z "$line" ]; then
+              echo "::error::Termux 索引里也找不到 $pkg —— 上游可能改名或下架，需要人工处理。"
+              return 1
+            fi
+            fn="$(echo "$line" | cut -d" " -f1)"
+            isha="$(echo "$line" | cut -d" " -f2)"
+            iver="$(echo "$line" | cut -d" " -f3)"
+            echo "::warning::$pkg 索引当前版本 = $iver；URL=$TERMUX_POOL_BASE/$fn；SHA256=$isha"
+            curl -fsSL --retry 3 --retry-delay 2 -o "$out" "$TERMUX_POOL_BASE/$fn"
+            echo "$isha  $out" | sha256sum -c -
           }
           extract_deb_data() {
             # deb = ar(debian-binary, control.tar.*, data.tar.*); unpack data.
@@ -117,9 +164,9 @@ jobs:
             ( cd "$dest" && ar x "$deb" && tar -xf data.tar.* )
           }
 
-          fetch_deb "$PROOT_DEB_URL" "$PROOT_DEB_SHA256" "$WORK/proot.deb"
-          fetch_deb "$TALLOC_DEB_URL" "$TALLOC_DEB_SHA256" "$WORK/talloc.deb"
-          fetch_deb "$SHMEM_DEB_URL" "$SHMEM_DEB_SHA256" "$WORK/shmem.deb"
+          fetch_deb proot            "$PROOT_DEB_URL"  "$PROOT_DEB_SHA256"  "$WORK/proot.deb"
+          fetch_deb libtalloc        "$TALLOC_DEB_URL" "$TALLOC_DEB_SHA256" "$WORK/talloc.deb"
+          fetch_deb libandroid-shmem "$SHMEM_DEB_URL"  "$SHMEM_DEB_SHA256"  "$WORK/shmem.deb"
           extract_deb_data "$WORK/proot.deb" "$WORK/proot"
           extract_deb_data "$WORK/talloc.deb" "$WORK/talloc"
           extract_deb_data "$WORK/shmem.deb" "$WORK/shmem"
