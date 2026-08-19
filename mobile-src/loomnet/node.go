@@ -2,8 +2,12 @@ package loomnet
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -16,6 +20,17 @@ import (
 // It occupies the semantic slot of today's spoofable X-Relay-From but its value
 // is now cryptographically trusted (§2.4).
 const headerLoomFrom = "X-Loom-From"
+
+// headerLoomFp carries the mTLS-verified SPKI fingerprint of a trusted OR
+// provisional inbound peer (stamped by serveHandler; any client-supplied value
+// is overwritten). tempconn 兑换/审计据此认对端身份。
+const headerLoomFp = "X-Loom-Peer-Fp"
+
+// headerLoomProvisionalFrom carries an UNTRUSTED (provisional, tempconn 配对期)
+// inbound peer's cert CN. It is stamped INSTEAD of headerLoomFrom so no
+// downstream handler mistakes a not-yet-trusted peer for a trusted caller; such
+// a connection is also confined to Options.ProvisionalPath.
+const headerLoomProvisionalFrom = "X-Loom-Provisional-From"
 
 // Directory supplies per-peer overlay metadata and the account trust set,
 // sourced live from the Hub machine list (§4.1, §2.2). The Hub is the ONLY
@@ -56,6 +71,136 @@ type Options struct {
 	// PublicAdvertise is this machine's 公网直连 address ("host:port") reported
 	// to peers via heartbeat; "" = 公网直连 off. Validated by New.
 	PublicAdvertise string
+	// ProvisionalGate reports whether an unknown inbound peer may be accepted as
+	// a provisional (redeem-only) connection — true while a tempconn pairing
+	// window is open. nil = never (the pre-tempconn behavior: unknown peers are
+	// rejected at the mTLS handshake).
+	ProvisionalGate func() bool
+	// ProvisionalPath is the ONLY request path a provisional (untrusted) inbound
+	// peer may reach; every other path returns 403. Empty = provisional peers
+	// can reach nothing (they still complete the handshake but are dead-ended).
+	// tempconn sets it to the one-time redeem endpoint.
+	ProvisionalPath string
+	// RelayConfig 是中继服务坐标（由 server 层从 Hub /api/overlay/config 拉取
+	// 后注入）。空值 = 中继未启用，relayDialer 不可用。
+	//
+	// JWT 为空时中继仍然可用于**匿名会合**（tempconn）：坐标本身是公开信息，
+	// 未登录 Hub 的机器经公开端点也能取到。此时账号内的 relayDialer 不注册，
+	// 只有 rendezvousDialer 生效。
+	RelayConfig *RelayConfig
+	// RendezvousKeyFor 返回用于经中继会合联系 peerID 的会合键（tempconn 的持久
+	// 密钥，双方在兑换连接码时共享）。返回 "" = 该对端没有会合通道。nil = 会合
+	// 拨号方式整体不可用。由 server 层接 tempconn 注入。
+	RendezvousKeyFor func(peerID string) string
+}
+
+// RelayConfig 是中继服务的连接坐标。中继是 TURN 式密文包转发器，用于直连/
+// 公网直连均不可用时的兜底连接方式。StunAddrs 是 STUN 观测点（含中继端口和
+// 第二端口），用于客户端 NAT 类型检测——两次 reflexive port 相同 = cone NAT
+// （可打洞），不同 = symmetric NAT（降级中继）。
+type RelayConfig struct {
+	QuicAddr  string   // 中继 QUIC/UDP 公网地址，如 "vanta.timefiles.online:7343"
+	WSSUrl    string   // WSS 降级路径（QUIC/UDP 不可达时走 Cloudflare Tunnel 回退）
+	JWT       string   // Hub JWT，用于中继 HELLO/OPEN 认证
+	RelaySPKI string   // 中继自签证书公钥的 SPKI 指纹（hex sha256，Hub 下发）；空 = 不钉扎中继 TLS（旧 Hub，向后兼容）
+	StunAddrs []string // STUN 观测点公网坐标，用于 NAT 类型检测
+	// ConnectionPrefs 是该账号的连接偏好（nil = 未设置，默认全开）。控制
+	// 本机注册哪些拨号方式：Direct=false 禁用局域网/公网/反向直连，P2P=false
+	// 禁用 NAT 打洞，Relay=false 禁用中继。
+	ConnectionPrefs *ConnectionPrefs
+}
+
+// ConnectionPrefs 是账号级连接偏好，控制 DialerRegistry 注册哪些拨号方式。
+// 三个字段用 *bool 区分「显式设置」与「未设置」——未设置按默认值处理。
+type ConnectionPrefs struct {
+	Direct *bool
+	P2P    *bool
+	Relay  *bool
+	// SyncModels 控制「模型渠道（含密钥）自动同步到本账号所有主机」。
+	// nil/未设置默认 true（保持服务端自动领养行为）。false 关闭自动领养，
+	// 各机器模型渠道各自维护。
+	SyncModels *bool
+}
+
+// DirectEnabled 报告「直接连接」（局域网/公网/反向直连）是否启用。nil/未设置
+// 默认启用。
+func (p *ConnectionPrefs) DirectEnabled() bool {
+	return p == nil || p.Direct == nil || *p.Direct
+}
+
+// P2PEnabled 报告「P2P 穿透」是否启用。nil/未设置默认启用。
+func (p *ConnectionPrefs) P2PEnabled() bool {
+	return p == nil || p.P2P == nil || *p.P2P
+}
+
+// RelayEnabled 报告「服务器中继」是否启用。未设置（nil）时返回 true——不
+// 拦截中继，让 relayDialer 自行按 QuicAddr 是否配置判断可用性（保持未设置
+// 偏好的原有行为）。显式关闭（Relay=false）才禁用中继。
+func (p *ConnectionPrefs) RelayEnabled() bool {
+	return p == nil || p.Relay == nil || *p.Relay
+}
+
+// SyncModelsEnabled 报告「模型渠道自动同步」是否启用。nil/未设置默认 true
+// （保持方案 A 的服务端自动领养行为）。
+func (p *ConnectionPrefs) SyncModelsEnabled() bool {
+	return p == nil || p.SyncModels == nil || *p.SyncModels
+}
+
+// Fingerprint 返回中继配置的确定性指纹（坐标 + JWT + SPKI + STUN 观测点），用于
+// 检测配置变化（Hub 换中继地址、JWT 轮换、中继重启换自签证书等）——relayClient
+// 懒单例据此 close 旧 client 并重建。nil → ""。JWT 只进 sha256 哈希、绝不进日志
+// （哈希不可逆）。RelaySPKI 进指纹是 S2 钉扎的正确性必需：Hub 重启会重新生成
+// 一次性自签证书（SPKI 变化），若不进指纹，客户端会沿用旧 SPKI 钉扎新证书而
+// 永久拒绝握手。
+func (rc *RelayConfig) Fingerprint() string {
+	if rc == nil {
+		return ""
+	}
+	h := sha256.New()
+	io.WriteString(h, rc.QuicAddr)
+	h.Write([]byte{0})
+	io.WriteString(h, rc.WSSUrl)
+	h.Write([]byte{0})
+	io.WriteString(h, rc.JWT)
+	h.Write([]byte{0})
+	io.WriteString(h, rc.RelaySPKI)
+	h.Write([]byte{0})
+	for _, s := range rc.StunAddrs {
+		io.WriteString(h, s)
+		h.Write([]byte{0})
+	}
+	// 连接偏好进指纹：偏好变化必须触发 SetRelayConfig 重新注入，否则
+	// PollRelayConfig 的指纹判断认为「没变」→ dialer 的偏好拦截永远不生效。
+	if p := rc.ConnectionPrefs; p != nil {
+		h.Write([]byte("prefs"))
+		h.Write([]byte{0})
+		io.WriteString(h, p.Fingerprint())
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// Fingerprint 返回连接偏好的确定性指纹（四个三态开关的逐位编码）。
+// **四个开关一个都不能漏**：轮询侧靠指纹判断「偏好变没变」，漏掉哪个，
+// 用户在 Hub 上改那个开关就永远不会下发到客户端——SyncModels 曾被漏掉，
+// 导致「模型渠道（含密钥）自动同步」关掉后后端仍在同步（假失效的隐私开关）。
+// nil → ""。
+func (p *ConnectionPrefs) Fingerprint() string {
+	if p == nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, v := range []*bool{p.Direct, p.P2P, p.Relay, p.SyncModels} {
+		switch {
+		case v == nil:
+			b.WriteByte('x')
+		case *v:
+			b.WriteByte('1')
+		default:
+			b.WriteByte('0')
+		}
+		b.WriteByte(0)
+	}
+	return b.String()
 }
 
 // Node is the process-local overlay endpoint: one shared QUIC/UDP socket that
@@ -77,6 +222,13 @@ type Node struct {
 	connsMu sync.Mutex
 	conns   map[string]Session
 
+	// inboundConns tracks every LIVE verified inbound session (adopted or not)
+	// so ClosePeer can tear down a peer's active connection — needed by tempconn
+	// 取消信任/立刻接管, since a provisional (unadopted) controller connection
+	// is not in conns. Deregistered when the connection dies.
+	inboundMu    sync.Mutex
+	inboundConns map[*quicSession]struct{}
+
 	pathsMu sync.Mutex
 	paths   map[string]string
 
@@ -92,6 +244,61 @@ type Node struct {
 	reverseRequest func(ctx context.Context, peerID string) error
 	reverseMu      sync.Mutex
 	reverseWaiters map[string][]reverseWaiter
+
+	// 中继客户端（懒初始化，可重建）：与当前中继配置匹配的 client 只建一次，
+	// 多条电路复用同一 QUIC 连接的不同流；配置变化（坐标/JWT/STUN 变更）时
+	// close 旧 client 并重建。nil = 中继未配置或尚未使用。
+	relay   *relayClient
+	relayMu sync.Mutex
+	// connPrefs 是账号连接偏好的独立注入槽（relayMu 保护）——与中继坐标解耦，
+	// Hub 未配置中继时偏好照样生效。nil = 未注入（回落 RelayConfig 里的旧通道，
+	// 再回落全开默认）。
+	connPrefs *ConnectionPrefs
+
+	// relayCfgFp 是已创建 relayClient 对应的中继配置指纹（relayMu 保护）。
+	// relayClient() 据此检测配置变化——Hub 换中继地址 / JWT 轮换后不再沿用
+	// 旧坐标无限 HELLO-ERR（M8）。
+	relayCfgFp string
+	// relayPunchRegistered / relayDialerRegistered 分别标记 P2P 打洞与中继
+	// dialer 是否已注册（各自幂等——DialerRegistry.Register 是 append，重复
+	// 注册会重复尝试；拆成两个标记让「先只有 STUN 观测点、后补中继地址」的
+	// 配置演进也能注册上 relay dialer）。relayServing 标记 serveRelay 循环
+	// 是否已启动（只启动一次）。
+	relayPunchRegistered  atomic.Bool
+	relayDialerRegistered atomic.Bool
+	relayServing          atomic.Bool
+
+	// P2P 打洞（阶段2）：loomOfferSender 是「经 Hub 信令向 peer 发 loom-offer
+	// 并等待 loom-answer」的注入口（server 层接 hubconn；nil = 信令未接入，
+	// punchDialer 不可用）。loomOfferHandler 是「收到 peer 的 loom-offer 后
+	// 返回本机 reflexive addr 作为 answer」的 B 侧处理（nil = 不响应打洞请求）。
+	loomOfferSender  func(ctx context.Context, peerID, myReflexiveAddr string) (peerReflexiveAddr string, err error)
+	loomOfferHandler func(fromMachineID, offerAddr string) (answerAddr string, err error)
+	punchMu          sync.Mutex
+	// punchCache 记录每个 peer 上次打洞的结果（成功/失败），失败的 peer 下次
+	// 直接跳过打洞走中继，避免 symmetric NAT 用户每次都等 5s 超时。
+	punchCache map[string]punchCacheEntry
+
+	// 匿名会合（tempconn，0.15.37）：未登录 Hub 的两台机器经中继会合。
+	// rzKey 是本机自己的会合键（B 角色，用于在中继登记等待呼入）；rzServer 是
+	// 对应的常驻登记客户端；rzDialers 按**对端**会合键缓存拨号客户端（A 角色，
+	// 电路是其上的一条流，必须与会话同寿）。rzCoordFp 是这批客户端对应的中继
+	// 坐标指纹，坐标一变全部作废重建。
+	rzMu         sync.Mutex
+	rzKey        string
+	rzServer     *relayClient
+	rzServerFp   string
+	rzDialers    map[string]*relayClient
+	rzCoordFp    string
+	rzServing    atomic.Bool
+	rzRegistered atomic.Bool
+}
+
+// punchCacheEntry 是打洞结果缓存，避免对 symmetric NAT 反复尝试打洞。
+type punchCacheEntry struct {
+	ok         bool
+	failReason string
+	cachedAt   time.Time
 }
 
 // New builds a Node and loads/creates its overlay identity. Start must be called
@@ -122,9 +329,11 @@ func New(opts Options) (*Node, error) {
 		opts:           opts,
 		identity:       id,
 		conns:          map[string]Session{},
+		inboundConns:   map[*quicSession]struct{}{},
 		paths:          map[string]string{},
 		Registry:       NewDialerRegistry(),
 		reverseWaiters: map[string][]reverseWaiter{},
+		punchCache:     map[string]punchCacheEntry{},
 	}
 	n.rt = &http.Transport{
 		DialContext:           n.dialStream,
@@ -144,16 +353,23 @@ func (n *Node) Start(ctx context.Context) error {
 	}
 	n.ctx, n.cancel = context.WithCancel(ctx)
 
-	tr, err := newTransport(n.ctx, n.identity, n.opts.Directory, n.opts.UDPPort)
+	tr, err := newTransport(n.ctx, n.identity, n.opts.Directory, n.opts.UDPPort, n.opts.ProvisionalGate)
 	if err != nil {
 		n.cancel()
 		return err
 	}
 	n.tr = tr
 
-	// 入站连接注册回调（0.14.3 反向互通）：mTLS 验证过的入站连接同时登记为
-	// 到该对端的可复用出站会话。
-	ln, err := tr.listen(func(s *quicSession) { n.adoptInbound(s) })
+	// 入站连接注册回调（0.14.3 反向互通）：mTLS 验证过的入站连接先登记进
+	// inboundConns（供 ClosePeer 断开），再——仅当对端已受信时——登记为到该
+	// 对端的可复用出站会话。provisional（tempconn 配对期未受信）连接绝不被
+	// adopt：否则其自报 CN 可污染本机出站缓存，把发往同 CN 机器的流量导给它。
+	ln, err := tr.listen(func(s *quicSession) {
+		n.trackInbound(s)
+		if n.inboundTrusted(s.RemoteMachineID(), s.fingerprint) {
+			n.adoptInbound(s)
+		}
+	})
 	if err != nil {
 		n.cancel()
 		tr.close()
@@ -177,6 +393,11 @@ func (n *Node) Start(ctx context.Context) error {
 	n.Registry.Register(&publicDialer{n: n})
 	n.Registry.Register(&reverseDialer{n: n})
 
+	// P2P 打洞 + 中继（阶段2）+ 临时连接会合（0.15.37）：按 RelayConfig 注册
+	// （Start 时若有配置则立即注册；未配置则等 server 层拉到坐标后经
+	// SetRelayConfig 动态注入）。
+	n.applyRelayConfig()
+
 	return nil
 }
 
@@ -190,10 +411,147 @@ func (n *Node) SetReverseRequester(fn func(ctx context.Context, peerID string) e
 	n.reverseMu.Unlock()
 }
 
+// SetRelayConfig 动态设置中继/打洞配置（server 层在 Hub 连接后从
+// /api/overlay/config 拉取注入；启动时若有配置也可在 Options 传入）。可以
+// 在 New 之后、Start 之后调用；重复调用会更新 opts.RelayConfig（relayClient
+// 懒重建读取新值），punch/relay dialer 只注册一次、serveRelay 只启动一次
+// （DialerRegistry.Register 是 append，重复注册会重复尝试）。
+// 并发安全：opts.RelayConfig 的写与 relayClient()/RelayConfig() 的读都持
+// relayMu（dialer 在拨号前的直读沿用既有语义，见 relayDialer/punchDialer）。
+func (n *Node) SetRelayConfig(rc *RelayConfig) {
+	n.relayMu.Lock()
+	n.opts.RelayConfig = rc
+	// 中继配置携带的偏好（旧通道）同步进独立字段，否则 SetConnectionPrefs
+	// 注入过一次之后，relay 带来的新偏好会被那个字段永久遮蔽。
+	if rc != nil && rc.ConnectionPrefs != nil {
+		n.connPrefs = rc.ConnectionPrefs
+	}
+	n.relayMu.Unlock()
+	n.applyRelayConfig()
+}
+
+// applyRelayConfig 根据当前 opts.RelayConfig 注册 P2P 打洞与中继 dialer
+// （各自幂等，只注册一次），并在 node 已启动时确保 B 侧 serveRelay 循环只
+// 启动一次。Start 与 SetRelayConfig 共用。node 未启动（started == false）时
+// 只注册 dialer 不启动 serveRelay——Start 尾部会再调一次本函数补启动
+// （SetRelayConfig 可能在 Start 前调用：启动注入经 hubRunCtx 异步轮询，
+// 不能拿未就绪的 n.ctx 起 serveRelay）。
+func (n *Node) applyRelayConfig() {
+	n.relayMu.Lock()
+	rc := n.opts.RelayConfig
+	n.relayMu.Unlock()
+	if rc == nil {
+		return
+	}
+	if len(rc.StunAddrs) > 0 && n.relayPunchRegistered.CompareAndSwap(false, true) {
+		// P2P 打洞（阶段2）：Priority 35，在反向公网直连（30）之后、中继（40）
+		// 之前——打洞失败自动降级中继。
+		n.Registry.Register(&punchDialer{n: n})
+	}
+	if rc.QuicAddr != "" && n.relayDialerRegistered.CompareAndSwap(false, true) {
+		// 中继（TURN 式密文包转发）：Priority 40，在所有直连方式之后尝试。
+		n.Registry.Register(&relayDialer{n: n})
+	}
+	if (rc.QuicAddr != "" || rc.WSSUrl != "") && n.rzRegistered.CompareAndSwap(false, true) {
+		// 临时连接会合：Priority 50，梯队最后一级。坐标可用即注册——它不依赖
+		// JWT，未登录 Hub 的机器正是它服务的对象。
+		n.Registry.Register(&rendezvousDialer{n: n})
+	}
+	n.ensureServeRelay(rc)
+	n.ensureServeRendezvous()
+}
+
+// ensureServeRelay 在 node 已启动且配置含中继地址时，确保 B 侧 serveRelay
+// 循环只启动一次。用 n.started（atomic）判断启动态——atomic 读写建立
+// happens-before，保证 serveRelay goroutine 一定能看到 Start 写入的 n.ctx
+// （无 data race）。node 未启动时静默跳过，由 Start 尾部 applyRelayConfig
+// 补启动。
+func (n *Node) ensureServeRelay(rc *RelayConfig) {
+	if rc == nil || rc.QuicAddr == "" {
+		return
+	}
+	if !n.started.Load() {
+		return
+	}
+	if n.relayServing.CompareAndSwap(false, true) {
+		go n.serveRelay()
+	}
+}
+
+// RelayConfig 返回当前生效的中继配置快照（SetRelayConfig 注入的），nil = 未
+// 配置。返回拷贝，调用方可安全持有。供诊断/测试观察配置是否注入成功。
+func (n *Node) RelayConfig() *RelayConfig {
+	n.relayMu.Lock()
+	defer n.relayMu.Unlock()
+	rc := n.opts.RelayConfig
+	if rc == nil {
+		return nil
+	}
+	cp := *rc
+	cp.StunAddrs = append([]string(nil), rc.StunAddrs...)
+	return &cp
+}
+
+// SetConnectionPrefs 独立注入账号连接偏好。**偏好绝不能寄生在中继配置的通道
+// 上**：Hub 没配中继坐标（自建 Hub / 中继临时关闭）时 FetchRelayConfig 没有
+// 中继配置可注入，四个开关就会一个都不生效、syncModels 被硬锁在「开」。所以
+// 偏好走这条独立通道，与中继坐标彻底解耦。nil = 回落默认（全开）。
+// 并发安全（持 relayMu 写，与 ConnectionPrefs() 的读同锁）。
+func (n *Node) SetConnectionPrefs(p *ConnectionPrefs) {
+	n.relayMu.Lock()
+	n.connPrefs = p
+	n.relayMu.Unlock()
+}
+
+// ConnectionPrefs 返回当前生效的连接偏好，nil = 未设置（默认全开）。
+// 优先取 SetConnectionPrefs 注入的独立值；未注入时回落 RelayConfig.ConnectionPrefs
+// （Options 直接构造 / SetRelayConfig 携带的旧通道）。并发安全（持 relayMu 读）。
+func (n *Node) ConnectionPrefs() *ConnectionPrefs {
+	n.relayMu.Lock()
+	defer n.relayMu.Unlock()
+	if n.connPrefs != nil {
+		return n.connPrefs
+	}
+	if n.opts.RelayConfig == nil {
+		return nil
+	}
+	return n.opts.RelayConfig.ConnectionPrefs
+}
+
 func (n *Node) reverseRequester() func(ctx context.Context, peerID string) error {
 	n.reverseMu.Lock()
 	defer n.reverseMu.Unlock()
 	return n.reverseRequest
+}
+
+// SetLoomOfferSender injects the「经 Hub 信令向 peer 发 loom-offer 并等待
+// loom-answer」的发送器（server 层接 hubconn.SendLoomOffer；nil = 信令未接入，
+// punchDialer 不可用）。Safe to call before Start。
+func (n *Node) SetLoomOfferSender(fn func(ctx context.Context, peerID, myReflexiveAddr string) (peerReflexiveAddr string, err error)) {
+	n.punchMu.Lock()
+	n.loomOfferSender = fn
+	n.punchMu.Unlock()
+}
+
+func (n *Node) loomOfferSenderFn() func(ctx context.Context, peerID, myReflexiveAddr string) (string, error) {
+	n.punchMu.Lock()
+	defer n.punchMu.Unlock()
+	return n.loomOfferSender
+}
+
+// SetLoomOfferHandler injects the「收到 peer 的 loom-offer 后返回本机 reflexive
+// addr 作为 answer」的 B 侧处理（server 层接 hubconn 的 SetLoomOfferHandler →
+// 调用本机 punch B 侧逻辑）。Safe to call before Start。
+func (n *Node) SetLoomOfferHandler(fn func(fromMachineID, offerAddr string) (answerAddr string, err error)) {
+	n.punchMu.Lock()
+	n.loomOfferHandler = fn
+	n.punchMu.Unlock()
+}
+
+func (n *Node) loomOfferHandlerFn() func(fromMachineID, offerAddr string) (string, error) {
+	n.punchMu.Lock()
+	defer n.punchMu.Unlock()
+	return n.loomOfferHandler
 }
 
 // NotifyReverseOutcome ingests the peer's dial-back result（0.14.4，经 Hub 信令
@@ -292,6 +650,119 @@ func (n *Node) Stop() {
 	}
 	if n.tr != nil {
 		n.tr.close()
+	}
+	n.relayMu.Lock()
+	if n.relay != nil {
+		n.relay.close()
+		n.relay = nil
+	}
+	n.relayMu.Unlock()
+	n.closeRendezvous()
+}
+
+// relayClient 返回与当前中继配置匹配的懒客户端（同一个中继地址只连一次，
+// 多条电路复用同一 QUIC 连接的不同流）。配置变化（坐标/JWT/STUN 变更）时
+// close 旧 client 并重建——M8：不再「首次创建后永远用旧坐标」，Hub 换中继
+// 地址或 JWT 轮换后 serveRelay 以 30s backoff 无限 HELLO-ERR 的问题由此消除。
+// 配置被清除（nil）时关闭旧 client 并返回 nil。注入 Directory 和 onIncoming
+// 回调以支持 B 侧（被叫方）逻辑：收到 INCOMING 后 ACCEPT 并把入站 Session
+// 接入 node。
+// closeRelayClient 关闭当前中继 client（若有）并清空配置指纹——下一次
+// relayClient() 会按当时的配置懒重建。偏好关闭中继时由 serveRelay 调用，
+// 切断本机与 Hub 中继之间的常驻 QUIC 连接（入站面）。
+func (n *Node) closeRelayClient() {
+	n.relayMu.Lock()
+	defer n.relayMu.Unlock()
+	if n.relay != nil {
+		n.relay.close()
+		n.relay = nil
+	}
+	n.relayCfgFp = ""
+}
+
+func (n *Node) relayClient() *relayClient {
+	n.relayMu.Lock()
+	defer n.relayMu.Unlock()
+	rc := n.opts.RelayConfig
+	if rc == nil {
+		// 配置被清除：关闭旧 client（切断旧坐标的控制连接/电路）并清空指纹。
+		if n.relay != nil {
+			n.relay.close()
+			n.relay = nil
+		}
+		n.relayCfgFp = ""
+		return nil
+	}
+	fp := rc.Fingerprint()
+	if n.relay != nil {
+		if n.relayCfgFp == fp {
+			// 同一配置：复用现有 client（幂等）。
+			return n.relay
+		}
+		// 配置变化：关闭旧 client（旧坐标的 HELLO/电路立即失效）并重建。
+		n.relay.close()
+		n.relay = nil
+	}
+	n.relay = newRelayClient(rc.QuicAddr, rc.WSSUrl, n.opts.MachineID, rc.JWT, rc.RelaySPKI, n.identity, n.opts.Directory, n.adoptRelayInbound)
+	n.relayCfgFp = fp
+	return n.relay
+}
+
+// serveRelay 维护到中继的持久连接（B 侧）。连接断开后自动重连；配置被清除
+// 时保持循环存活，等配置重新注入（PollRelayConfig 每 30s 一轮）后按新坐标
+// 重建连接。A 侧拨号时也会懒连中继，但 B 侧必须一直在线才能接收 INCOMING。
+func (n *Node) serveRelay() {
+	backoff := time.Second
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		default:
+		}
+		if !n.ConnectionPrefs().RelayEnabled() {
+			// 用户关掉「服务器中继」：出站已被 relayDialer 的偏好门拦下，
+			// **入站也必须停**——否则本机仍与 Hub 中继保持常驻 QUIC 连接并
+			// 照常接受入站中继会话，那个开关就是名不副实的（「所有流量经过
+			// Hub 服务器转发」的开关关掉后流量照走）。开关重开后下一轮自动
+			// 重连（relayClient 懒重建）。
+			n.closeRelayClient()
+			select {
+			case <-n.ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
+			continue
+		}
+		rc := n.relayClient()
+		if rc == nil {
+			// 中继配置被清除（或尚未注入）：等配置重新注入再连。
+			select {
+			case <-n.ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+		err := rc.ensureConnected(n.ctx)
+		if err != nil {
+			log.Printf("[loomnet/relay] B 侧主动连中继失败：%v，%v 后重试", err, backoff)
+			select {
+			case <-n.ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			backoff = min(backoff*2, 30*time.Second)
+			continue
+		}
+		// 连接成功，重置 backoff。ensureConnected 是幂等的——已连接则直接返回。
+		// 连接断开后 serveIncoming 退出 + reset() 置 hello=false，
+		// 下次 ensureConnected 会重新建连。定期轮询检测+重连。
+		backoff = time.Second
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-time.After(10 * time.Second):
+		}
 	}
 }
 
@@ -488,29 +959,112 @@ func (n *Node) SelfReachability() []MethodStatus {
 // ctxKeyPeerID keys the verified peer machineID stashed by connContext.
 type ctxKeyPeerID struct{}
 
-// connContext stashes each inbound stream's mTLS-verified machineID into the
-// request context so serveHandler can stamp a trusted X-Loom-From (§2.4).
+// ctxKeyPeerFp keys the verified peer SPKI fingerprint stashed by connContext.
+type ctxKeyPeerFp struct{}
+
+// connContext stashes each inbound stream's mTLS-verified machineID and SPKI
+// fingerprint into the request context so serveHandler can stamp trusted
+// headers and recompute per-request trust (§2.4 + tempconn provisional).
 func (n *Node) connContext(ctx context.Context, c net.Conn) context.Context {
 	if mc, ok := c.(interface{ RemoteMachineID() string }); ok {
 		if id := mc.RemoteMachineID(); id != "" {
-			return context.WithValue(ctx, ctxKeyPeerID{}, id)
+			ctx = context.WithValue(ctx, ctxKeyPeerID{}, id)
+		}
+	}
+	if fc, ok := c.(interface{ RemoteFingerprint() string }); ok {
+		if fp := fc.RemoteFingerprint(); fp != "" {
+			ctx = context.WithValue(ctx, ctxKeyPeerFp{}, fp)
 		}
 	}
 	return ctx
 }
 
-// serveHandler wraps LocalHandler, overwriting X-Loom-From with the verified
-// peer identity (an unverifiable caller has the header stripped so no spoofed
-// value survives), then dispatches to the same mux local requests use.
+// inboundTrusted reports whether an inbound peer (CN, fp) is a fully-trusted
+// account/tempconn member — i.e. the account fingerprint set binds this exact
+// CN→fp. A provisional (tempconn 配对期) peer is NOT in the set and returns false.
+func (n *Node) inboundTrusted(cn, fp string) bool {
+	if cn == "" || fp == "" || n.opts.Directory == nil {
+		return false
+	}
+	return n.opts.Directory.AccountFingerprints()[cn] == fp
+}
+
+// serveHandler wraps LocalHandler and stamps the verified caller identity. Any
+// client-supplied X-Loom-* header is FIRST stripped so no spoofed value ever
+// survives. A trusted peer gets X-Loom-From (+ fingerprint); a provisional
+// (untrusted, tempconn 配对期) peer gets NO X-Loom-From — only the provisional
+// headers — and is confined to Options.ProvisionalPath (everything else 403),
+// so a not-yet-trusted machine can reach the one-time redeem endpoint and
+// nothing more.
 func (n *Node) serveHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if id, ok := r.Context().Value(ctxKeyPeerID{}).(string); ok && id != "" {
-			r.Header.Set(headerLoomFrom, id)
-		} else {
-			r.Header.Del(headerLoomFrom)
+		r.Header.Del(headerLoomFrom)
+		r.Header.Del(headerLoomFp)
+		r.Header.Del(headerLoomProvisionalFrom)
+
+		id, _ := r.Context().Value(ctxKeyPeerID{}).(string)
+		fp, _ := r.Context().Value(ctxKeyPeerFp{}).(string)
+		if id == "" {
+			n.opts.LocalHandler.ServeHTTP(w, r)
+			return
 		}
+		if n.inboundTrusted(id, fp) {
+			r.Header.Set(headerLoomFrom, id)
+			r.Header.Set(headerLoomFp, fp)
+			n.opts.LocalHandler.ServeHTTP(w, r)
+			return
+		}
+		// Provisional: redeem-only.
+		if n.opts.ProvisionalPath == "" || r.URL.Path != n.opts.ProvisionalPath {
+			http.Error(w, "loomnet: 未建立信任的对端只能访问临时连接兑换端点", http.StatusForbidden)
+			return
+		}
+		r.Header.Set(headerLoomProvisionalFrom, id)
+		r.Header.Set(headerLoomFp, fp)
 		n.opts.LocalHandler.ServeHTTP(w, r)
 	})
+}
+
+// trackInbound registers a live inbound session for ClosePeer, and drops it
+// when the connection dies.
+func (n *Node) trackInbound(s *quicSession) {
+	n.inboundMu.Lock()
+	n.inboundConns[s] = struct{}{}
+	n.inboundMu.Unlock()
+	go func() {
+		select {
+		case <-s.conn.Context().Done():
+		case <-n.ctx.Done():
+		}
+		n.inboundMu.Lock()
+		delete(n.inboundConns, s)
+		n.inboundMu.Unlock()
+	}()
+}
+
+// ClosePeer tears down every live connection to machineID — the adopted
+// outbound session (conns) and any inbound sessions — evicting the cache so a
+// later dial re-runs the ladder. tempconn 用它在取消信任/立刻接管时立即断开
+// 一台主控端的活跃会话。
+func (n *Node) ClosePeer(machineID string) {
+	n.connsMu.Lock()
+	if s := n.conns[machineID]; s != nil {
+		delete(n.conns, machineID)
+		_ = s.Close()
+	}
+	n.connsMu.Unlock()
+
+	n.inboundMu.Lock()
+	var victims []*quicSession
+	for s := range n.inboundConns {
+		if s.RemoteMachineID() == machineID {
+			victims = append(victims, s)
+		}
+	}
+	n.inboundMu.Unlock()
+	for _, s := range victims {
+		_ = s.Close()
+	}
 }
 
 // localLANIPs enumerates this host's non-loopback, non-link-local unicast IPs

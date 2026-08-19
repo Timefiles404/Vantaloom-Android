@@ -24,15 +24,16 @@ const (
 // transport owns the single shared UDP socket and its quic.Transport (§3.1):
 // LAN-direct dialing and the inbound listener multiplex over this one socket.
 type transport struct {
-	acceptCtx context.Context // node lifetime; bounds inbound accepts and sessions
-	identity  *Identity
-	dir       Directory
-	udp       *net.UDPConn
-	qt        *quic.Transport
-	quicConf  *quic.Config
+	acceptCtx        context.Context // node lifetime; bounds inbound accepts and sessions
+	identity         *Identity
+	dir              Directory
+	allowProvisional func() bool // tempconn 配对窗口开启时接纳未知对端（见 verify.go）
+	udp              *net.UDPConn
+	qt               *quic.Transport
+	quicConf         *quic.Config
 }
 
-func newTransport(acceptCtx context.Context, id *Identity, dir Directory, udpPort int) (*transport, error) {
+func newTransport(acceptCtx context.Context, id *Identity, dir Directory, udpPort int, allowProvisional func() bool) (*transport, error) {
 	// udpPort 0 = ephemeral (LAN-only machines re-advertise each heartbeat);
 	// a fixed port is required for 公网直连 so port-forward/安全组 rules hold.
 	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: udpPort})
@@ -40,11 +41,12 @@ func newTransport(acceptCtx context.Context, id *Identity, dir Directory, udpPor
 		return nil, fmt.Errorf("loomnet: bind overlay udp socket (port %d): %w", udpPort, err)
 	}
 	return &transport{
-		acceptCtx: acceptCtx,
-		identity:  id,
-		dir:       dir,
-		udp:       udp,
-		qt:        &quic.Transport{Conn: udp},
+		acceptCtx:        acceptCtx,
+		identity:         id,
+		dir:              dir,
+		allowProvisional: allowProvisional,
+		udp:              udp,
+		qt:               &quic.Transport{Conn: udp},
 		quicConf: &quic.Config{
 			MaxIdleTimeout:       idleTimeout,
 			KeepAlivePeriod:      keepAlivePeriod,
@@ -56,6 +58,12 @@ func newTransport(acceptCtx context.Context, id *Identity, dir Directory, udpPor
 
 func (t *transport) localUDPAddr() *net.UDPAddr {
 	return t.udp.LocalAddr().(*net.UDPAddr)
+}
+
+// udpConn 返回 overlay 共享 UDP socket，供打洞逻辑复用（STUN 探测 + 打洞包
+// 都从这个 socket 发出，保证 NAT 映射与 QUIC 连接复用同一端口）。
+func (t *transport) udpConn() *net.UDPConn {
+	return t.udp
 }
 
 // clientTLS is the outbound (dialer) config: it presents our certificate and
@@ -71,7 +79,9 @@ func (t *transport) clientTLS(expectedFingerprint string) *tls.Config {
 }
 
 // serverTLS is the inbound (listener) config: it forces client certificates and
-// accepts any peer whose CN→fingerprint is in the account set (§2.3).
+// accepts any peer whose CN→fingerprint is in the account set (§2.3), plus —
+// when a tempconn pairing window is open — an unknown peer as a provisional
+// (redeem-only) connection (see verifyInboundWithProvisional).
 func (t *transport) serverTLS() *tls.Config {
 	return &tls.Config{
 		Certificates:          []tls.Certificate{t.identity.TLSCertificate()},
@@ -79,7 +89,7 @@ func (t *transport) serverTLS() *tls.Config {
 		MinVersion:            tls.VersionTLS13,
 		ClientAuth:            tls.RequireAnyClientCert,
 		InsecureSkipVerify:    true,
-		VerifyPeerCertificate: verifyInbound(t.dir.AccountFingerprints),
+		VerifyPeerCertificate: verifyInboundWithProvisional(t.dir.AccountFingerprints, t.allowProvisional),
 	}
 }
 
@@ -91,12 +101,12 @@ func (t *transport) dial(ctx context.Context, addr net.Addr, expectedFingerprint
 	if err != nil {
 		return nil, fmt.Errorf("loomnet: dial %s at %s: %w", intendedID, addr, err)
 	}
-	gotID, _, err := peerIdentity(conn.ConnectionState().TLS)
+	gotID, gotFP, err := peerIdentity(conn.ConnectionState().TLS)
 	if err != nil {
 		_ = conn.CloseWithError(quic.ApplicationErrorCode(1), "missing identity")
 		return nil, err
 	}
-	return newQUICSession(t.acceptCtx, conn, gotID), nil
+	return newQUICSession(t.acceptCtx, conn, gotID, gotFP), nil
 }
 
 func (t *transport) close() {
@@ -105,6 +115,49 @@ func (t *transport) close() {
 	}
 	if t.udp != nil {
 		_ = t.udp.Close()
+	}
+}
+
+// dialQUICOnTransport 在给定的 quic.Transport（绑独立 UDP socket，如打洞 socket）
+// 上拨一个 QUIC+mTLS 连接到 addr，pin expectedFingerprint。intendedID 仅用于错误
+// 上下文。用于 P2P 打洞：打洞成功后在独立 socket 上建 QUIC 连接。
+func dialQUICOnTransport(ctx context.Context, qt *quic.Transport, conn *net.UDPConn, addr *net.UDPAddr, expectedFingerprint, intendedID string, id *Identity) (*quicSession, error) {
+	tlsConf := &tls.Config{
+		Certificates:          []tls.Certificate{id.TLSCertificate()},
+		NextProtos:            []string{alpn},
+		MinVersion:            tls.VersionTLS13,
+		InsecureSkipVerify:    true,
+		VerifyPeerCertificate: verifyOutbound(expectedFingerprint),
+	}
+	qconn, err := qt.Dial(ctx, addr, tlsConf, &quic.Config{
+		MaxIdleTimeout:       idleTimeout,
+		KeepAlivePeriod:      keepAlivePeriod,
+		HandshakeIdleTimeout: handshakeIdle,
+		MaxIncomingStreams:   maxIncomingStreams,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("loomnet: punch dial %s at %s: %w", intendedID, addr, err)
+	}
+	gotID, fp, err := peerIdentity(qconn.ConnectionState().TLS)
+	if err != nil {
+		_ = qconn.CloseWithError(quic.ApplicationErrorCode(1), "missing identity")
+		return nil, err
+	}
+	// quicSession 的 acceptCtx 用 context.Background()——独立 socket 的 QUIC
+	// 连接不绑定 node 生命周期，由 session 自己管理。
+	return newQUICSession(context.Background(), qconn, gotID, fp), nil
+}
+
+// tlsConfForServer 构造打洞 B 侧（被叫方）的 TLS server 配置：要求客户端证书，
+// pin 期望的 peer 指纹（只接受这一个 peer 的连接）。用于 punch acceptPunchQUIC。
+func tlsConfForServer(id *Identity, expectedPeerFingerprint string) *tls.Config {
+	return &tls.Config{
+		Certificates:          []tls.Certificate{id.TLSCertificate()},
+		NextProtos:            []string{alpn},
+		MinVersion:            tls.VersionTLS13,
+		ClientAuth:            tls.RequireAnyClientCert,
+		InsecureSkipVerify:    true,
+		VerifyPeerCertificate: verifyOutbound(expectedPeerFingerprint),
 	}
 }
 
@@ -155,22 +208,22 @@ func (l *quicListener) acceptConns() {
 		if err != nil {
 			return // listener closed or context done
 		}
-		id, _, err := peerIdentity(conn.ConnectionState().TLS)
+		id, fp, err := peerIdentity(conn.ConnectionState().TLS)
 		if err != nil {
 			_ = conn.CloseWithError(quic.ApplicationErrorCode(1), "missing identity")
 			continue
 		}
 		if l.onConn != nil {
-			l.onConn(newQUICSession(l.ctx, conn, id))
+			l.onConn(newQUICSession(l.ctx, conn, id, fp))
 		}
-		go l.demux(conn, id)
+		go l.demux(conn, id, fp)
 	}
 }
 
 // demux turns every stream a peer opens on one QUIC connection into a separate
 // net.Conn handed to Accept, so http.Server treats each stream as its own HTTP
 // connection. Idempotent per connection (see demuxed).
-func (l *quicListener) demux(conn *quic.Conn, id string) {
+func (l *quicListener) demux(conn *quic.Conn, id, fp string) {
 	l.demuxMu.Lock()
 	if _, dup := l.demuxed[conn]; dup {
 		l.demuxMu.Unlock()
@@ -188,7 +241,7 @@ func (l *quicListener) demux(conn *quic.Conn, id string) {
 		if err != nil {
 			return // connection gone
 		}
-		c := newStreamConn(conn, st, id)
+		c := newStreamConn(conn, st, id, fp)
 		select {
 		case l.accepted <- c:
 		case <-l.closed:

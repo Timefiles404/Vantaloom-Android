@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Dialer is the pluggable connection-method interface. Each concrete
@@ -44,6 +45,13 @@ type Dialer interface {
 	// Session; on failure it returns an error and the ladder tries the next
 	// method.
 	Dial(ctx context.Context, peerID string) (Session, error)
+
+	// Budget 是本方式单次拨号的最长耗时（Dial 内部自己套的那个超时）。
+	// 调用方据此推导「整条梯队跑满」的外层预算——外层 deadline 一旦短于
+	// 梯队总和，就会在中途掐断并把逐方式富错误吞成裸 context deadline
+	// exceeded（0.13.8 教训）。放进接口而不是让调用方手抄一个数字：新加
+	// 方式不声明预算就编译不过，那个数字从此不会过期。
+	Budget() time.Duration
 }
 
 // DialerRegistry is an ordered collection of Dialers. It is safe for concurrent
@@ -84,6 +92,17 @@ func (r *DialerRegistry) snapshot() []Dialer {
 	copy(out, r.dialers)
 	r.mu.Unlock()
 	return out
+}
+
+// LadderWorstCase 返回整条梯队全部方式串行跑满的总预算。外层 deadline
+// （如拓扑拨测）必须严格大于它，否则会在梯队中途掐断，把每种方式的具体
+// 失败原因吞成一句 context deadline exceeded（0.13.8 教训）。
+func (r *DialerRegistry) LadderWorstCase() time.Duration {
+	var total time.Duration
+	for _, d := range r.snapshot() {
+		total += d.Budget()
+	}
+	return total
 }
 
 // DialLadder runs the registered dialers in priority order. The first to
@@ -170,6 +189,12 @@ func activePathDetail(name string) string {
 		return "正在使用：经对方公网地址的 QUIC 直连（mTLS 指纹双向校验），不经过任何服务器。"
 	case pathReverse, pathInbound:
 		return "正在使用：对方主动建立的直连连接（QUIC 双向复用，mTLS 指纹双向校验），不经过任何服务器。"
+	case pathPunch:
+		return "正在使用：经 NAT 打洞建立的 P2P 直连（QUIC+mTLS 指纹双向校验），不经过任何服务器。"
+	case pathRelay:
+		return "正在使用：经 Hub 中继转发连接（中继只见密文，A↔B 之间 mTLS 端到端加密）。"
+	case pathRendezvous:
+		return "正在使用：经 Hub 中继的临时连接会合电路（凭连接码里的会合键配对；中继只见密文，两端 mTLS 端到端加密）。"
 	default:
 		return "正在使用此连接方式。"
 	}
@@ -193,9 +218,10 @@ type MethodStatus struct {
 // peer's Hub-reported LAN addresses, mTLS fingerprint pinned.
 type directDialer struct{ n *Node }
 
-func (d *directDialer) Name() string  { return pathDirect }
-func (d *directDialer) Label() string { return "局域网直连" }
-func (d *directDialer) Priority() int { return 10 }
+func (d *directDialer) Name() string          { return pathDirect }
+func (d *directDialer) Label() string         { return "局域网直连" }
+func (d *directDialer) Priority() int         { return 10 }
+func (d *directDialer) Budget() time.Duration { return directTimeout }
 
 func (d *directDialer) Available(ctx context.Context, peerID string) bool {
 	ok, _ := d.Explain(ctx, peerID)
@@ -203,6 +229,9 @@ func (d *directDialer) Available(ctx context.Context, peerID string) bool {
 }
 
 func (d *directDialer) Explain(_ context.Context, peerID string) (bool, string) {
+	if prefs := d.n.ConnectionPrefs(); !prefs.DirectEnabled() {
+		return false, "账号「连接偏好」已关闭直接连接（局域网/公网/反向直连）。"
+	}
 	_, eps, ok := d.n.opts.Directory.PeerInfo(peerID)
 	if !ok {
 		return false, "尚未从 Hub 获取到对方的 overlay 连接信息。对方需在线并运行 0.13.7 及以上版本（0.13.6 存在应用内重新登录后停止上报连接信息的缺陷，升级后自动恢复）；本机每 60 秒自动刷新一次对方信息。"
@@ -233,9 +262,10 @@ func (d *directDialer) Dial(ctx context.Context, peerID string) (Session, error)
 // the peers aren't on the same LAN.
 type publicDialer struct{ n *Node }
 
-func (d *publicDialer) Name() string  { return pathPublic }
-func (d *publicDialer) Label() string { return "公网直连" }
-func (d *publicDialer) Priority() int { return 20 }
+func (d *publicDialer) Name() string          { return pathPublic }
+func (d *publicDialer) Label() string         { return "公网直连" }
+func (d *publicDialer) Priority() int         { return 20 }
+func (d *publicDialer) Budget() time.Duration { return publicTimeout }
 
 func (d *publicDialer) Available(ctx context.Context, peerID string) bool {
 	ok, _ := d.Explain(ctx, peerID)
@@ -243,6 +273,9 @@ func (d *publicDialer) Available(ctx context.Context, peerID string) bool {
 }
 
 func (d *publicDialer) Explain(_ context.Context, peerID string) (bool, string) {
+	if prefs := d.n.ConnectionPrefs(); !prefs.DirectEnabled() {
+		return false, "账号「连接偏好」已关闭直接连接（局域网/公网/反向直连）。"
+	}
 	_, eps, ok := d.n.opts.Directory.PeerInfo(peerID)
 	if !ok {
 		return false, "尚未从 Hub 获取到对方的 overlay 连接信息。对方需在线并运行 0.13.7 及以上版本；本机每 60 秒自动刷新一次对方信息。"
@@ -268,9 +301,10 @@ func (d *publicDialer) Dial(ctx context.Context, peerID string) (Session, error)
 // Priority 30：仅在 LAN 直连与正向公网直连都不可用/失败后才尝试。
 type reverseDialer struct{ n *Node }
 
-func (d *reverseDialer) Name() string  { return pathReverse }
-func (d *reverseDialer) Label() string { return "反向公网直连" }
-func (d *reverseDialer) Priority() int { return 30 }
+func (d *reverseDialer) Name() string          { return pathReverse }
+func (d *reverseDialer) Label() string         { return "反向公网直连" }
+func (d *reverseDialer) Priority() int         { return 30 }
+func (d *reverseDialer) Budget() time.Duration { return reverseTimeout }
 
 func (d *reverseDialer) Available(ctx context.Context, peerID string) bool {
 	ok, _ := d.Explain(ctx, peerID)
@@ -278,6 +312,9 @@ func (d *reverseDialer) Available(ctx context.Context, peerID string) bool {
 }
 
 func (d *reverseDialer) Explain(_ context.Context, peerID string) (bool, string) {
+	if prefs := d.n.ConnectionPrefs(); !prefs.DirectEnabled() {
+		return false, "账号「连接偏好」已关闭直接连接（局域网/公网/反向直连）。"
+	}
 	if d.n.opts.PublicAdvertise == "" {
 		// 方向感知（0.14.4）：反拨解决的是「本机可被公网直连、对方不可」的
 		// 方向。对方已有公网时，本机→对方走正向「公网直连」即可——此时把
@@ -364,4 +401,68 @@ func firstSameSubnet(nets []*net.IPNet, peerLAN []string) string {
 		}
 	}
 	return ""
+}
+
+// relayDialer 是中继连接方式（TURN 式密文包转发）：直连/公网直连/反向均不可用
+// 时的兜底。本机（A）连中继，发 OPEN 请求连对端（B），中继把 A、B 两条流字节
+// 级对拼，A↔B 在拼出的流上跑 mTLS + yamux。中继看不到明文。Priority 40：在
+// 所有直连方式之后尝试。
+type relayDialer struct{ n *Node }
+
+func (d *relayDialer) Name() string          { return pathRelay }
+func (d *relayDialer) Label() string         { return "中继" }
+func (d *relayDialer) Priority() int         { return 40 }
+func (d *relayDialer) Budget() time.Duration { return relayTimeout }
+
+func (d *relayDialer) Available(ctx context.Context, peerID string) bool {
+	ok, _ := d.Explain(ctx, peerID)
+	return ok
+}
+
+func (d *relayDialer) Explain(_ context.Context, peerID string) (bool, string) {
+	if prefs := d.n.ConnectionPrefs(); !prefs.RelayEnabled() {
+		return false, "账号「连接偏好」已关闭服务器中继。"
+	}
+	rc := d.n.opts.RelayConfig
+	if rc == nil || rc.QuicAddr == "" {
+		return false, "中继未启用（未配置中继坐标）。中继是 TURN 式密文包转发器，用于直连/公网直连均不可用时的兜底连接方式。"
+	}
+	fp, _, ok := d.n.opts.Directory.PeerInfo(peerID)
+	if !ok {
+		return false, "尚未从 Hub 获取到对方的 overlay 连接信息。"
+	}
+	if fp == "" {
+		return false, "对方未上报 overlay 指纹（可能未运行 overlay 或版本过旧）。"
+	}
+	return true, "将经 Hub 中继建立到对方的密文转发电路（中继只见密文，A↔B 之间 mTLS 端到端加密）。"
+}
+
+func (d *relayDialer) Dial(ctx context.Context, peerID string) (Session, error) {
+	rc := d.n.opts.RelayConfig
+	if rc == nil || rc.QuicAddr == "" {
+		return nil, errors.New("loomnet: relay: 中继未配置")
+	}
+	fp, _, ok := d.n.opts.Directory.PeerInfo(peerID)
+	if !ok {
+		return nil, fmt.Errorf("loomnet: relay: 无 %s 的目录信息", peerID)
+	}
+	dctx, cancel := context.WithTimeout(ctx, relayTimeout)
+	defer cancel()
+
+	client := d.n.relayClient()
+	pipe, err := client.openCircuit(dctx, peerID)
+	if err != nil {
+		return nil, err
+	}
+	sess, err := newRelaySession(dctx, pipe, fp, peerID, d.n.identity)
+	if err != nil {
+		return nil, err
+	}
+	// 发起方也要把入站流接进 http server：对端（被叫方）会经这条电路开流过来
+	//（双向复用）。被叫方在 adoptRelayInbound 里做了同样的事——发起方缺了这个
+	// AcceptStream 循环，对端开的流会堆积无人处理 → 反向请求永久超时
+	//（2026-08-11 三机联调实锤：A 拨 B 成功后 B 反向拨 A 复用同一电路，B 的请求卡死）。
+	ln := newRelayInboundListener(sess)
+	go func() { _ = d.n.httpSrv.Serve(ln) }()
+	return sess, nil
 }

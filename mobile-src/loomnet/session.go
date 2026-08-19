@@ -25,13 +25,14 @@ type Session interface {
 // quicSession is the QUIC implementation of Session: QUIC over the shared UDP
 // socket, with native stream multiplexing.
 type quicSession struct {
-	conn      *quic.Conn
-	remoteID  string
-	acceptCtx context.Context // node lifetime; bounds the blocking AcceptStream
+	conn        *quic.Conn
+	remoteID    string
+	fingerprint string          // peer's mTLS-verified SPKI fingerprint
+	acceptCtx   context.Context // node lifetime; bounds the blocking AcceptStream
 }
 
-func newQUICSession(acceptCtx context.Context, conn *quic.Conn, remoteID string) *quicSession {
-	return &quicSession{conn: conn, remoteID: remoteID, acceptCtx: acceptCtx}
+func newQUICSession(acceptCtx context.Context, conn *quic.Conn, remoteID, fingerprint string) *quicSession {
+	return &quicSession{conn: conn, remoteID: remoteID, fingerprint: fingerprint, acceptCtx: acceptCtx}
 }
 
 func (s *quicSession) OpenStream(ctx context.Context) (net.Conn, error) {
@@ -39,7 +40,7 @@ func (s *quicSession) OpenStream(ctx context.Context) (net.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("loomnet: open stream to %s: %w", s.remoteID, err)
 	}
-	return newStreamConn(s.conn, st, s.remoteID), nil
+	return newStreamConn(s.conn, st, s.remoteID, s.fingerprint), nil
 }
 
 func (s *quicSession) AcceptStream() (net.Conn, error) {
@@ -47,10 +48,11 @@ func (s *quicSession) AcceptStream() (net.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("loomnet: accept stream from %s: %w", s.remoteID, err)
 	}
-	return newStreamConn(s.conn, st, s.remoteID), nil
+	return newStreamConn(s.conn, st, s.remoteID, s.fingerprint), nil
 }
 
-func (s *quicSession) RemoteMachineID() string { return s.remoteID }
+func (s *quicSession) RemoteMachineID() string   { return s.remoteID }
+func (s *quicSession) RemoteFingerprint() string { return s.fingerprint }
 
 // RemoteAddr is the peer's UDP address on this connection — used by the
 // topology to classify HOW an adopted-inbound connection reached us (private
@@ -62,6 +64,29 @@ func (s *quicSession) Close() error {
 	return s.conn.CloseWithError(quic.ApplicationErrorCode(0), "closed")
 }
 
+// punchSession 包装 quicSession，额外持有独立 UDP socket 和 QUIC transport。
+// 打洞使用独立 socket（非 overlay socket），socket 生命周期必须延续到 QUIC 连接
+// 关闭——Close 时先关 QUIC 连接，再关 transport 和 UDP socket。
+type punchSession struct {
+	*quicSession
+	qt   *quic.Transport
+	conn *net.UDPConn
+}
+
+func (s *punchSession) Close() error {
+	err := s.quicSession.Close()
+	if s.qt != nil {
+		s.qt.Close()
+	}
+	if s.conn != nil {
+		s.conn.Close()
+	}
+	return err
+}
+
+// RemoteAddr 透传到内层 quicSession（拓扑分类用）。
+func (s *punchSession) RemoteAddr() net.Addr { return s.quicSession.RemoteAddr() }
+
 // streamConn adapts a *quic.Stream (which has no Local/RemoteAddr of its own)
 // into a net.Conn by delegating addressing to the owning connection, per the
 // design's dialStream note. It also carries the peer's mTLS-verified machineID
@@ -71,18 +96,20 @@ func (s *quicSession) Close() error {
 // correct semantics for one HTTP request/response over a stream.
 type streamConn struct {
 	*quic.Stream
-	local    net.Addr
-	remote   net.Addr
-	remoteID string
+	local       net.Addr
+	remote      net.Addr
+	remoteID    string
+	fingerprint string
 }
 
-func newStreamConn(conn *quic.Conn, st *quic.Stream, remoteID string) *streamConn {
-	return &streamConn{Stream: st, local: conn.LocalAddr(), remote: conn.RemoteAddr(), remoteID: remoteID}
+func newStreamConn(conn *quic.Conn, st *quic.Stream, remoteID, fingerprint string) *streamConn {
+	return &streamConn{Stream: st, local: conn.LocalAddr(), remote: conn.RemoteAddr(), remoteID: remoteID, fingerprint: fingerprint}
 }
 
-func (c *streamConn) LocalAddr() net.Addr     { return c.local }
-func (c *streamConn) RemoteAddr() net.Addr    { return c.remote }
-func (c *streamConn) RemoteMachineID() string { return c.remoteID }
+func (c *streamConn) LocalAddr() net.Addr       { return c.local }
+func (c *streamConn) RemoteAddr() net.Addr      { return c.remote }
+func (c *streamConn) RemoteMachineID() string   { return c.remoteID }
+func (c *streamConn) RemoteFingerprint() string { return c.fingerprint }
 
 func (c *streamConn) Close() error {
 	c.Stream.CancelRead(0)

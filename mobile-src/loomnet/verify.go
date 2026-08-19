@@ -34,6 +34,18 @@ func verifyOutbound(expectedFingerprint string) func([][]byte, [][]*x509.Certifi
 // config. Binding CN→fingerprint (rather than merely "fingerprint is in the
 // set") prevents an in-account key from spoofing another machine's ID.
 func verifyInbound(accountFingerprints func() map[string]string) func([][]byte, [][]*x509.Certificate) error {
+	return verifyInboundWithProvisional(accountFingerprints, nil)
+}
+
+// verifyInboundWithProvisional extends verifyInbound with a「临时配对」escape
+// hatch (tempconn): when an UNKNOWN CN presents and allowProvisional() is true
+// (the node has an open pairing window), the handshake is ACCEPTED so the peer
+// can reach the one-time redeem endpoint. Such a connection is NOT trusted —
+// serveHandler recomputes trust per request against the same account set and
+// confines an untrusted (provisional) peer to the redeem path only, never
+// stamping a trusted X-Loom-From. A KNOWN CN with a mismatched fingerprint is
+// still rejected outright (no impersonation of an account/trusted machine).
+func verifyInboundWithProvisional(accountFingerprints func() map[string]string, allowProvisional func() bool) func([][]byte, [][]*x509.Certificate) error {
 	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 		leaf, fp, err := leafFingerprint(rawCerts)
 		if err != nil {
@@ -44,14 +56,16 @@ func verifyInbound(accountFingerprints func() map[string]string) func([][]byte, 
 		if accountFingerprints != nil {
 			set = accountFingerprints()
 		}
-		want, ok := set[cn]
-		if !ok {
-			return fmt.Errorf("loomnet: inbound peer %q not in account set", cn)
+		if want, ok := set[cn]; ok {
+			if want != fp {
+				return fmt.Errorf("loomnet: inbound peer %q fingerprint mismatch: got %s, expected %s", cn, fp, want)
+			}
+			return nil
 		}
-		if want != fp {
-			return fmt.Errorf("loomnet: inbound peer %q fingerprint mismatch: got %s, expected %s", cn, fp, want)
+		if allowProvisional != nil && allowProvisional() {
+			return nil
 		}
-		return nil
+		return fmt.Errorf("loomnet: inbound peer %q not in account set", cn)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"strconv"
 	"sync"
@@ -19,6 +20,7 @@ const (
 	directTimeout  = 3 * time.Second
 	publicTimeout  = 4 * time.Second
 	reverseTimeout = 9 * time.Second
+	relayTimeout   = 15 * time.Second // 中继：QUIC 连接 + HELLO + OPEN + B 的 ACCEPT + mTLS 握手
 )
 
 // Last-path labels reported by LastPath for the topology UI (§4.6, §7.4).
@@ -29,6 +31,11 @@ const (
 	pathPublic  = "public"
 	pathReverse = "reverse"
 	pathInbound = "inbound"
+	pathPunch   = "punch"
+	pathRelay   = "relay"
+	// pathRendezvous 是临时连接的匿名会合（0.15.37）：双方都没有 Hub 账号时
+	// 经中继按会合键配对，见 rendezvous.go。
+	pathRendezvous = "rendezvous"
 )
 
 // getOrDialConn returns a live Session to machineID, reusing the cached one or
@@ -273,8 +280,21 @@ func (n *Node) storeConn(machineID string, s Session, path string) {
 	// Evict from the cache when the underlying connection dies so the next dial
 	// re-runs the ladder (§3.4); dialStream's retry on an OpenStream failure is
 	// the backstop.
-	if cs, ok := s.(*quicSession); ok {
-		go n.watchConn(machineID, cs)
+	// punchSession 嵌入 *quicSession，需要提取内层来 watch（否则连接死了缓存
+	// 不清，后续请求用死连接超时）。
+	// relaySession 也必须有死亡通知：yamux 会话在底层中继电路死亡尚未被感知时
+	// （网络黑洞、relay 静默掐断），OpenStream 会被阻塞最多 30s（写超时）才报
+	// 错——watch 用 yamux 的 CloseChan() 在会话关闭的第一时间逐出缓存，让后续
+	// 请求立即重新走拨号阶梯而不是反复撞死会话。
+	switch cs := s.(type) {
+	case *quicSession:
+		go n.watchConn(machineID, cs, cs.conn.Context().Done())
+	case *punchSession:
+		if cs.quicSession != nil {
+			go n.watchConn(machineID, cs, cs.quicSession.conn.Context().Done())
+		}
+	case *relaySession:
+		go n.watchConn(machineID, cs, cs.CloseChan())
 	}
 
 	// 双向复用（0.14.3）：出站连接上对方开的流同样要进本机 http server（QUIC
@@ -282,7 +302,9 @@ func (n *Node) storeConn(machineID string, s Session, path string) {
 	// 无人 Accept 而挂死）。入站连接由 listener 自己 demux，不重复。
 	if path != pathInbound {
 		if cs, ok := s.(*quicSession); ok && n.listener != nil {
-			go n.listener.demux(cs.conn, machineID)
+			go n.listener.demux(cs.conn, machineID, cs.fingerprint)
+		} else if ps, ok := s.(*punchSession); ok && ps.quicSession != nil && n.listener != nil {
+			go n.listener.demux(ps.quicSession.conn, machineID, ps.quicSession.fingerprint)
 		}
 	}
 
@@ -298,8 +320,24 @@ func (n *Node) storeConn(machineID string, s Session, path string) {
 // demuxed the connection's inbound streams into the http server; this only
 // registers the OUTBOUND direction. Replaces any cached session (the inbound
 // one is live RIGHT NOW; a possibly-zombie predecessor dies via idle timeout).
-func (n *Node) adoptInbound(s *quicSession) {
+func (n *Node) adoptInbound(s Session) {
 	n.storeConn(s.RemoteMachineID(), s, pathInbound)
+}
+
+// adoptRelayInbound 把中继入站 Session 接入 node（B 侧被叫方）：注册为到
+// fromID 的可复用出站会话（storeConn with pathInbound），并启动一个
+// relayInboundListener 让 httpSrv.Serve 处理 yamux 流。relaySession 不走
+// QUIC listener 的 demux，需要独立的 listener 适配器。
+func (n *Node) adoptRelayInbound(fromID string, s Session) {
+	rs, ok := s.(*relaySession)
+	if !ok {
+		log.Printf("[loomnet/relay] adoptRelayInbound: 非 *relaySession 类型 (%T)，忽略", s)
+		s.Close()
+		return
+	}
+	n.storeConn(fromID, rs, pathInbound)
+	ln := newRelayInboundListener(rs)
+	go func() { _ = n.httpSrv.Serve(ln) }()
 }
 
 // --- reverse-connect waiters (0.14.3 反向互通) -------------------------------
@@ -367,9 +405,16 @@ func (n *Node) failReverseWaiters(machineID, reason string) {
 	}
 }
 
-func (n *Node) watchConn(machineID string, s *quicSession) {
+// watchConn 监视一个已缓存会话的生命周期：done 是底层连接的死亡通知通道，
+// 一旦关闭（或节点自身关闭）就把会话从缓存中逐出，让下一次 dial 重新跑
+// 拨号阶梯（§3.4）；dialStream 的 OpenStream 失败重试是兜底。退出条件只有
+// 两个——连接死亡（done 关闭）或节点关闭（n.ctx 取消），两种都不会泄漏
+// goroutine。done 的来源：QUIC 用 conn.Context().Done()（OpenStreamSync 快速
+// 失败），中继用 yamux 的 CloseChan()（主动 Close 或底层 pipe 死亡都会关闭，
+// 见 relaySession.CloseChan）。
+func (n *Node) watchConn(machineID string, s Session, done <-chan struct{}) {
 	select {
-	case <-s.conn.Context().Done():
+	case <-done:
 	case <-n.ctx.Done():
 	}
 	n.evictConn(machineID, s)
