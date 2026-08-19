@@ -76,8 +76,23 @@ jobs:
       - name: Install packaging prerequisites
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y patchelf unzip
+          # patchelf 与 unzip 在 ubuntu runner 镜像里本来就有 —— 这一步的 apt 日志
+          # 恒为 "0 upgraded, 0 newly installed"。也就是说它平时什么也不做，只在
+          # runner 的默认 apt 镜像（azure.archive.ubuntu.com）抽风时，把整条流水线
+          # 卡十几分钟：mirrorlist 把 azure 排在 archive.ubuntu.com 前面，每个索引
+          # 都要先耗完连接超时 + 重试才轮到兜底镜像（日志里成片的 Ign: 就是它）。
+          # 所以：先探，缺了才装；真要装也把挂掉的镜像摘掉并收紧超时。
+          missing=()
+          command -v patchelf >/dev/null 2>&1 || missing+=(patchelf)
+          command -v unzip    >/dev/null 2>&1 || missing+=(unzip)
+          if [ ${#missing[@]} -eq 0 ]; then
+            echo "patchelf / unzip 已在 runner 镜像中，跳过 apt"
+            exit 0
+          fi
+          echo "缺少：${missing[*]}——走 apt 安装"
+          sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt 2>/dev/null || true
+          sudo apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 update
+          sudo apt-get install --no-install-recommends -y "${missing[@]}"
 
       - name: Test the WebView bridge contract
         run: node --test android/app/src/test/js/bridge-shim.test.mjs
