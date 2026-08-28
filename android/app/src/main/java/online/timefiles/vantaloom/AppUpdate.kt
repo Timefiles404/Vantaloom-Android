@@ -11,6 +11,8 @@ import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -22,6 +24,23 @@ import java.util.concurrent.atomic.AtomicReference
  * the asset into cache with progress, and hands the file to the system package
  * installer on an explicit user tap. Every CI build is signed with the same key,
  * so the download installs in place with no uninstall.
+ *
+ * Three rules this file exists to keep (each one was a real "update silently
+ * does nothing"):
+ *
+ *  1. **The check returns as soon as GitHub answers.** The download runs on its
+ *     own thread afterwards and reports through [status]. Blocking the caller
+ *     until a multi-tens-of-MB download finished meant the JS bridge's 120 s
+ *     timeout rejected a perfectly healthy download, and it also parked the
+ *     bridge's single shared worker for minutes (every other native call —
+ *     startLocalRuntime, pickImages, shareFile — queued behind it).
+ *  2. **A finished download survives process death.** The state lives in memory,
+ *     but the *fact* that build N is sitting in `cache/update/` is written to
+ *     prefs, so a later launch re-adopts it instead of answering `noFile` to a
+ *     user who can see the file is there.
+ *  3. **A failed parse is an error, never "up to date".** If `/releases/latest`
+ *     ever resolves to a non-APK release, `parseBuildFromTag` returns 0 — which
+ *     must not be laundered into 已是最新, or every phone goes quietly stale.
  */
 internal object AppUpdate {
     private const val OWNER = "Vantaloom"
@@ -29,6 +48,12 @@ internal object AppUpdate {
     private const val LATEST_URL = "https://api.github.com/repos/$OWNER/$REPO/releases/latest"
     private const val USER_AGENT = "Vantaloom-Android"
     private const val MAX_REDIRECTS = 5
+
+    private const val PREFS_FILE = "vantaloom_update"
+    private const val KEY_READY_BUILD = "ready_build"
+    private const val KEY_READY_NAME = "ready_name"
+    private const val KEY_READY_NOTES = "ready_notes"
+    private const val APK_NAME = "vantaloom-update.apk"
 
     enum class Phase(val wire: String) {
         IDLE("idle"),
@@ -63,11 +88,21 @@ internal object AppUpdate {
 
     private val state = AtomicReference(State())
 
+    /** Downloads run here, never on the JS bridge's shared worker. */
+    private val downloader = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "vantaloom-apk-download").apply { isDaemon = true }
+    }
+    private val downloading = AtomicBoolean(false)
+
+    private fun prefs(context: Context) =
+        context.applicationContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
+
     fun status(context: Context): State {
         val current = state.get()
         if (current.currentBuild == 0L) {
             state.compareAndSet(current, current.copy(currentBuild = installedBuild(context)))
         }
+        adoptCachedApk(context)
         return state.get()
     }
 
@@ -90,9 +125,52 @@ internal object AppUpdate {
     fun isUpdateAvailable(current: Long, latest: Long): Boolean = latest > 0 && latest > current
 
     /**
-     * Blocking: query the latest release, and (autoDownload) fetch its APK asset
-     * into cache. Call from a worker thread. Returns the resulting state. Never
-     * throws — failures land as Phase.ERROR so the caller can surface a message.
+     * Re-adopt an APK that a previous process already downloaded.
+     *
+     * Without this the state machine forgets everything on process death while
+     * the file itself survives in the cache dir: the banner disappears, and if
+     * the user finds the button anyway [install] answers `noFile` about a file
+     * that is plainly there. Only adopts when the recorded build is still newer
+     * than what is installed — after a successful install that test fails and
+     * the record is cleared.
+     */
+    private fun adoptCachedApk(context: Context) {
+        val current = state.get()
+        if (current.phase == Phase.CHECKING || current.phase == Phase.DOWNLOADING) return
+        if (current.apkPath.isNotBlank() && File(current.apkPath).exists()) return
+        val store = prefs(context)
+        val build = store.getLong(KEY_READY_BUILD, 0L)
+        if (build <= 0L) return
+        val installed = installedBuild(context)
+        val file = File(File(context.cacheDir, "update"), APK_NAME)
+        if (!isUpdateAvailable(installed, build) || !file.exists()) {
+            // Either already installed or the cache was evicted — drop the record
+            // so we never advertise an update we cannot deliver.
+            store.edit().clear().apply()
+            if (current.phase == Phase.READY) {
+                set(State(phase = Phase.IDLE, currentBuild = installed))
+            }
+            return
+        }
+        set(
+            State(
+                phase = Phase.READY,
+                currentBuild = installed,
+                latestBuild = build,
+                latestName = store.getString(KEY_READY_NAME, "") ?: "",
+                notes = store.getString(KEY_READY_NOTES, "") ?: "",
+                progress = 100,
+                apkPath = file.absolutePath,
+            )
+        )
+    }
+
+    /**
+     * Blocking only for the GitHub metadata request; call from a worker thread.
+     * When an update exists and `autoDownload` is set, the asset download is
+     * started on [downloader] and this returns immediately with
+     * [Phase.DOWNLOADING] — callers poll [status] for progress. Never throws:
+     * failures land as [Phase.ERROR] so the caller can surface a message.
      */
     fun check(context: Context, autoDownload: Boolean): State {
         val prev = state.get()
@@ -109,6 +187,16 @@ internal object AppUpdate {
             val latest = parseBuildFromTag(tag)
             val name = release.optString("name").ifBlank { tag }
             val notes = release.optString("body").take(600)
+            if (latest <= 0L) {
+                // 解析不出 build 号 ≠ 已是最新。二者长得一样的话，一次发布流程改动
+                // 就能让所有手机永久静默停更。
+                return set(
+                    state.get().copy(
+                        phase = Phase.ERROR,
+                        error = "最新发布 ${tag.ifBlank { "（无标签）" }} 不是 APK 版本，无法判断是否有更新",
+                    )
+                )
+            }
             if (!isUpdateAvailable(current, latest)) {
                 return set(
                     State(
@@ -123,7 +211,22 @@ internal object AppUpdate {
                 ?: return set(
                     state.get().copy(phase = Phase.ERROR, error = "该版本未附带 APK 安装包")
                 )
-            set(
+            // 已经下好同一个 build 就别重下（进程重启后最常见的一种情况）。
+            val cached = File(File(context.cacheDir, "update"), APK_NAME)
+            if (prefs(context).getLong(KEY_READY_BUILD, 0L) == latest && cached.exists()) {
+                return set(
+                    State(
+                        phase = Phase.READY,
+                        currentBuild = current,
+                        latestBuild = latest,
+                        latestName = name,
+                        notes = notes,
+                        progress = 100,
+                        apkPath = cached.absolutePath,
+                    )
+                )
+            }
+            val next = set(
                 State(
                     phase = if (autoDownload) Phase.DOWNLOADING else Phase.READY,
                     currentBuild = current,
@@ -132,17 +235,44 @@ internal object AppUpdate {
                     notes = notes,
                 )
             )
-            if (!autoDownload) return state.get()
-            val apk = download(context, assetUrl)
-            return set(
-                state.get().copy(
-                    phase = Phase.READY,
-                    progress = 100,
-                    apkPath = apk.absolutePath,
-                )
-            )
+            if (!autoDownload) return next
+            startDownload(context, assetUrl, latest, name, notes)
+            return state.get()
         } catch (e: Throwable) {
             return set(state.get().copy(phase = Phase.ERROR, error = e.message ?: "检查更新失败"))
+        }
+    }
+
+    private fun startDownload(
+        context: Context,
+        assetUrl: String,
+        build: Long,
+        name: String,
+        notes: String,
+    ) {
+        if (!downloading.compareAndSet(false, true)) return
+        val appContext = context.applicationContext
+        downloader.execute {
+            try {
+                val apk = download(appContext, assetUrl)
+                prefs(appContext).edit()
+                    .putLong(KEY_READY_BUILD, build)
+                    .putString(KEY_READY_NAME, name)
+                    .putString(KEY_READY_NOTES, notes)
+                    .apply()
+                set(
+                    state.get().copy(
+                        phase = Phase.READY,
+                        progress = 100,
+                        apkPath = apk.absolutePath,
+                        error = "",
+                    )
+                )
+            } catch (e: Throwable) {
+                set(state.get().copy(phase = Phase.ERROR, error = e.message ?: "下载失败"))
+            } finally {
+                downloading.set(false)
+            }
         }
     }
 
@@ -164,8 +294,9 @@ internal object AppUpdate {
         val dir = File(context.cacheDir, "update").apply { mkdirs() }
         // Clear any stale downloads so a half-finished file never gets installed.
         dir.listFiles()?.forEach { runCatching { it.delete() } }
-        val dst = File(dir, "vantaloom-update.apk")
-        var connection = openFollowing(url)
+        prefs(context).edit().clear().apply()
+        val dst = File(dir, APK_NAME)
+        val connection = openFollowing(url)
         try {
             val total = connection.contentLengthLong
             connection.inputStream.use { input ->
@@ -185,6 +316,9 @@ internal object AppUpdate {
                             }
                         }
                     }
+                    if (total > 0 && written != total) {
+                        throw IllegalStateException("下载不完整（${written}/${total} 字节）")
+                    }
                 }
             }
         } finally {
@@ -197,6 +331,7 @@ internal object AppUpdate {
      *  short result the UI maps to a toast: `launched` / `needsInstallPermission`
      *  / `noFile`. */
     fun install(context: Context): String {
+        adoptCachedApk(context)
         val path = state.get().apkPath
         if (path.isBlank()) return "noFile"
         val file = File(path)

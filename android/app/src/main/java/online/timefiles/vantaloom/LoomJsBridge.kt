@@ -58,6 +58,10 @@ class LoomJsBridge(
     private val onPickFiles: (callId: String) -> Unit = { _ -> },
     /** 文件夹选择回调（composer 加号「文件夹」→ MainActivity 拉起目录树选择器）。 */
     private val onPickFolder: (callId: String) -> Unit = { _ -> },
+    /** 「所有文件访问」这项系统特殊权限当前开没开（同步查询）。 */
+    private val onHasStorageAccess: () -> Boolean = { false },
+    /** 拉起「所有文件访问」系统授权页（agent 申请手机文件夹时用）。 */
+    private val onRequestStorageAccess: (callId: String) -> Unit = { _ -> },
 ) {
     private val worker = Executors.newSingleThreadExecutor()
 
@@ -229,6 +233,30 @@ class LoomJsBridge(
     @JavascriptInterface
     fun pickFolder(callId: String) {
         onPickFolder(callId)
+    }
+
+    /**
+     * 「所有文件访问」是否已授予（0.16.17）。同步、非特权——它只是一个关于本应用
+     * 自己的是否，不泄露任何东西，前端在 agent 申请手机文件夹时用它决定「这一次
+     * 该直接放行，还是该先把用户送进系统设置页」。
+     */
+    @JavascriptInterface
+    fun storageAccessGranted(): Boolean = onHasStorageAccess()
+
+    /**
+     * 申请「所有文件访问」：已授予则直接 resolve {"granted":true}；否则拉起系统
+     * 授权页并 resolve {"granted":false} —— 值是**此刻**的状态，用户去设置里打开
+     * 之后要回来再问一次（安卓不会把这项特殊权限的结果回调给我们）。
+     *
+     * 特权（会把用户送出应用、且结果决定运行时能读到多少东西）→ 走 secret 门。
+     */
+    @JavascriptInterface
+    fun requestStorageAccess(secret: String, callId: String) {
+        if (!authorized(secret)) {
+            reject(callId, "unauthorized")
+            return
+        }
+        onRequestStorageAccess(callId)
     }
 
     /**

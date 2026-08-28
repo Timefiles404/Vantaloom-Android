@@ -63,6 +63,12 @@ window.__loomNative = {
   pickImages() {},
   pickFiles() {},
   pickFolder() {},
+  storageAccessGranted: () => true,
+  requestStorageAccess(secret, callbackId) {
+    calls.storageAccessArgs = [...arguments]
+    void secret
+    void callbackId
+  },
   shareFile() {},
   startLocalRuntime() {},
   stopLocalRuntime() {},
@@ -91,6 +97,17 @@ window.__loomNative = {
       `__vantaloom_loopback_token=${signature}`
     calls.authorize.push({ original, requestTarget, signed, signature })
     return signed
+  },
+  appVersionName: () => "0.0.0-test",
+  appUpdateStatus: () => '{"phase":"idle"}',
+  checkAppUpdate(callbackId) {
+    calls.checkUpdateArgs = [...arguments]
+    calls.checkUpdateCallbackId = callbackId
+  },
+  installAppUpdate(secret, callbackId) {
+    calls.installUpdateArgs = [...arguments]
+    calls.installUpdateSecret = secret
+    calls.installUpdateCallbackId = callbackId
   },
   notificationTarget: () => '{"conversationId":"conv-x"}',
   restoreLocalRuntimeAuth(secret) {
@@ -194,6 +211,24 @@ assert.ok(
   !/capability(?:Token|Key)/.test(shim),
   "capability key contract leaked into JavaScript state"
 )
+// 应用更新四件套的适配形状。checkAppUpdate 不特权（只发一个 callId），
+// installAppUpdate 特权（secret 在前、callId 在后）——把 secret 漏掉或顺序写反，
+// 表现都是「点了更新没反应」，而这是用户唯一的升级入口。
+assert.equal(typeof window.__loomBridge.appVersionName, "function")
+assert.equal(window.__loomBridge.appVersionName(), "0.0.0-test")
+assert.equal(window.__loomBridge.appUpdateStatus(), '{"phase":"idle"}')
+window.__loomBridge.checkAppUpdate("loom-check-1")
+assert.deepEqual(calls.checkUpdateArgs, ["loom-check-1"])
+window.__loomBridge.installAppUpdate("loom-install-1")
+assert.deepEqual(calls.installUpdateArgs, [bridgeSecret, "loom-install-1"])
+assert.equal(calls.installUpdateSecret, bridgeSecret)
+
+// 手机文件夹授权那一跳：requestStorageAccess 是特权方法（secret 在前）。漏掉
+// secret 的表现是「点同意 → 系统设置页没弹出来 → 用户以为坏了」。
+assert.equal(window.__loomBridge.storageAccessGranted(), true)
+window.__loomBridge.requestStorageAccess("loom-storage-1")
+assert.deepEqual(calls.storageAccessArgs, [bridgeSecret, "loom-storage-1"])
+
 const helperDescriptor = Object.getOwnPropertyDescriptor(
   window,
   "__loomAuthorizeLocalRuntimeURL"

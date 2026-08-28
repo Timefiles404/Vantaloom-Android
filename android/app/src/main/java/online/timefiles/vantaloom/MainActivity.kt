@@ -214,6 +214,10 @@ class MainActivity : Activity() {
             onPickFolder = { callId ->
                 runOnUiThread { launchFolderPick(callId) }
             },
+            onHasStorageAccess = { hasAllFilesAccess() },
+            onRequestStorageAccess = { callId ->
+                runOnUiThread { launchStorageAccessGrant(callId) }
+            },
         )
         webView.addJavascriptInterface(bridge, "__loomNative")
 
@@ -401,6 +405,23 @@ class MainActivity : Activity() {
                 REQ_STORAGE_LEGACY,
             )
         }
+    }
+
+    /**
+     * agent 申请手机文件夹时的权限跳转（0.16.17）：已授权直接回 true；没授权就把
+     * 用户送进系统设置页并回 false —— 卡片保持待决，用户开完回来再点一次同意。
+     *
+     * 与 launchFilePick/launchFolderPick 共用同一对判定/跳转函数，刻意**不**顺手
+     * 打开目录选择器：这条路上目录是 agent 指名的，用户要决定的是「同不同意它读
+     * 这个目录」，再弹一次选择器只会让他去选一个自己没打算选的东西。
+     */
+    private fun launchStorageAccessGrant(callId: String) {
+        if (hasAllFilesAccess()) {
+            bridge.resolveFromShell(callId, """{"granted":true}""")
+            return
+        }
+        launchAllFilesAccessRequest()
+        bridge.resolveFromShell(callId, """{"granted":false}""")
     }
 
     private fun launchFilePick(callId: String) {
@@ -800,6 +821,10 @@ class MainActivity : Activity() {
     },
     pickFiles: function (callbackId) { N.pickFiles(callbackId); },
     pickFolder: function (callbackId) { N.pickFolder(callbackId); },
+    storageAccessGranted: function () { return N.storageAccessGranted(); },
+    requestStorageAccess: function (callbackId) {
+      N.requestStorageAccess(__loomSecret, callbackId);
+    },
     shareFile: function (path, name, callbackId) {
       N.shareFile(callbackId, String(path || ""), String(name || ""));
     },
