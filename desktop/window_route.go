@@ -86,6 +86,12 @@ func isIDERoute(route string) bool {
 // spawnSubWindow 以 `--route <route>` 拉起本进程自身的可执行文件作为副窗口。
 // 子进程与父进程互相独立：不共享生命周期、不建立 job/进程组耦合，父窗口关闭
 // 不连带杀死子窗口，反之亦然（goroutine 里的 Wait 只负责回收进程句柄）。
+//
+// ⚠️ **刻意不 winproc.Hide——这不是疏漏。** 拉起的是壳自己（Wails，GUI 子系统，
+// `-H windowsgui` 打包，根本不分配控制台，没有可闪的黑框）；而 winproc.Hide 会置
+// STARTF_USESHOWWINDOW + SW_HIDE，新窗口会**以隐藏状态启动**——用户点了「新窗口」
+// 却什么也看不见。要开窗口的地方不隐藏窗口。
+// 见 winproc 包的调用点审计闸门（豁免名单里显式登记了这个函数）。
 func spawnSubWindow(route string) error {
 	validated, err := validateSubWindowRoute(route)
 	if err != nil {

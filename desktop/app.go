@@ -437,14 +437,34 @@ func (a *App) startMonitor() {
 	})
 }
 
+// autoReviveAfter is how long the backend must stay unreachable before the
+// monitor tries to start it again itself. The backend is NOT supervised (the
+// Windows tray that used to respawn it was removed — see vantaloomctl's
+// componentSpecs), so a crashed vantaloom-api stays dead until something
+// restarts it. Before this existed the only cure was closing and reopening the
+// window, which is exactly what users reported.
+const autoReviveAfter = 8 * time.Second
+
 // monitorBackend polls the backend health endpoint. When the backend restarts
 // with a different version (e.g. after a CLI-driven update), it force-reloads
 // the webview so the user gets the new frontend without restarting the shell.
-// When the backend goes down (during an update), it injects a lightweight
-// overlay so the user sees progress instead of a broken page.
+// When the backend goes down it shows a recovery overlay, tries to revive the
+// backend, and tears the overlay back down once it answers again.
+//
+// 三条不变量（都是修 bug 修出来的，别退回去）：
+//
+//  1. **覆盖层必须显式拆掉。** 它挂在宿主页的 document.body 上，而恢复动作走
+//     __vtlReloadApp——那只刷 iframe，不动宿主页。于是「加」有代码、「减」没有，
+//     一旦弹出就永久糊在那儿，关窗重开是唯一出路。removeOverlayJS 是那个减号。
+//  2. **文案不许替后端编故事。** 壳看不见真正的更新：前端的「检查更新」spawn 的
+//     是一个脱离进程的 updater，壳只看得到「后端没了」。所以以前对**任何**健康
+//     中断都写「正在更新 Vantaloom」，而绝大多数中断其实是后端崩了——用户盯着一
+//     个根本不存在的更新进度条。现在只陈述可观测的事实。
+//  3. **必须有人真的去救。** 后端无人监管，光显示进度条不会让它回来。
 func (a *App) monitorBackend() {
 	downSince := time.Time{}
 	overlayShown := false
+	revived := false
 
 	for {
 		select {
@@ -458,11 +478,23 @@ func (a *App) monitorBackend() {
 			if downSince.IsZero() {
 				downSince = time.Now()
 			}
+			down := time.Since(downSince)
 			// Show an overlay after the backend has been down for 4+ seconds
 			// (ignore brief healthcheck blips during normal operation).
-			if !overlayShown && time.Since(downSince) > 4*time.Second {
+			if !overlayShown && down > 4*time.Second {
 				overlayShown = true
-				wruntime.WindowExecJS(a.ctx, updateOverlayJS)
+				wruntime.WindowExecJS(a.ctx, downOverlayJS)
+			}
+			// Try to bring it back exactly once per outage. `vantaloomctl start`
+			// is idempotent: if the process is actually alive and merely wedged,
+			// it won't double-start it.
+			if !revived && down > autoReviveAfter {
+				revived = true
+				go func() {
+					if err := a.mgr.Start(a.ctx); err != nil {
+						fmt.Printf("[desktop] auto-revive backend: %v\n", err)
+					}
+				}()
 			}
 			continue
 		}
@@ -470,10 +502,14 @@ func (a *App) monitorBackend() {
 		// Backend is up.
 		if overlayShown {
 			overlayShown = false
+			// Tear the overlay down FIRST: the reload below only refreshes the
+			// app iframe, which cannot remove a node owned by the host page.
+			wruntime.WindowExecJS(a.ctx, removeOverlayJS)
 			// Backend came back — force reload to pick up new frontend.
 			wruntime.WindowExecJS(a.ctx, "window.__vtlReloadApp ? window.__vtlReloadApp() : window.location.reload()")
 			a.lastVersion = v
 			downSince = time.Time{}
+			revived = false
 			continue
 		}
 
@@ -483,17 +519,69 @@ func (a *App) monitorBackend() {
 			wruntime.WindowExecJS(a.ctx, "window.__vtlReloadApp ? window.__vtlReloadApp() : window.location.reload()")
 		}
 		downSince = time.Time{}
+		revived = false
 	}
 }
 
-// updateOverlayJS injects a full-screen overlay when the backend goes down
-// during an update, matching the Vantaloom splash aesthetic.
-const updateOverlayJS = `(function(){
-  if(document.getElementById('__vt_update_overlay')) return;
+// RestartBackend restarts the local runtime. Bound to the recovery overlay's
+// 「重启后端」 button as window.go.main.App.RestartBackend() — the overlay is
+// injected into the HOST page, which is served from the Wails asset origin, so
+// the window.go bindings are available to it.
+func (a *App) RestartBackend() {
+	go func() {
+		if err := a.mgr.Start(a.ctx); err != nil {
+			fmt.Printf("[desktop] manual restart backend: %v\n", err)
+		}
+	}()
+}
+
+// DismissOverlay removes the recovery overlay unconditionally. Bound to the
+// overlay's 「关闭提示」 button: the last-resort escape hatch so a user is never
+// again trapped behind a full-screen panel with no way out but killing the
+// window.
+func (a *App) DismissOverlay() {
+	wruntime.WindowExecJS(a.ctx, removeOverlayJS)
+}
+
+// overlayID is the host-page node id for the backend-down overlay. Both the
+// inject and the remove script key off it — they are a matched pair; changing
+// one without the other is how the overlay became unremovable in the first
+// place.
+const overlayID = "__vt_update_overlay"
+
+// removeOverlayJS tears the overlay back down. It exists because the overlay
+// lives on the HOST page while every recovery path (__vtlReloadApp) only
+// refreshes the app iframe, so nothing on the reload path could ever remove it.
+const removeOverlayJS = `(function(){
+  var d=document.getElementById('` + overlayID + `');
+  if(d && d.parentNode) d.parentNode.removeChild(d);
+})();`
+
+// downOverlayJS injects a full-screen overlay when the backend stops answering,
+// matching the Vantaloom splash aesthetic.
+//
+// 它只陈述壳真正知道的事：后端没响应、正在自动重连。**不写「正在更新」**——壳
+// 看不见更新（前端触发的 updater 是脱离进程的），而后端中断绝大多数是崩溃，写
+// 「正在更新」就是对着用户编一个不存在的进度。三颗按钮是硬性逃生口：在此之前
+// 这个面板一旦弹出就没有任何出路。
+const downOverlayJS = `(function(){
+  if(document.getElementById('` + overlayID + `')) return;
   var d=document.createElement('div');
-  d.id='__vt_update_overlay';
+  d.id='` + overlayID + `';
   d.style.cssText='position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;flex-direction:column;background:rgba(11,13,20,0.92);backdrop-filter:blur(12px);font-family:-apple-system,BlinkMacSystemFont,Segoe UI,PingFang SC,Microsoft YaHei,system-ui,sans-serif;color:#f3f5fb;';
-  d.innerHTML='<div style="width:48px;height:48px;border-radius:14px;background:linear-gradient(135deg,#3ad0c8,#8b7bf0);display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:700;color:#0b0d14;margin-bottom:18px">V</div><div style="font-size:15px;font-weight:600;margin-bottom:8px">正在更新 Vantaloom</div><div style="font-size:13px;color:#8b93a7;margin-bottom:20px">后端服务重启中，完成后自动刷新…</div><div style="width:180px;height:4px;border-radius:99px;background:rgba(255,255,255,0.08);overflow:hidden"><div style="width:35%;height:100%;border-radius:99px;background:linear-gradient(90deg,#3ad0c8,#8b7bf0);animation:__vt_slide 1.1s ease-in-out infinite"></div></div><style>@keyframes __vt_slide{0%{margin-left:-35%}100%{margin-left:100%}}</style>';
+  d.innerHTML='<div style="width:48px;height:48px;border-radius:14px;background:linear-gradient(135deg,#3ad0c8,#8b7bf0);display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:700;color:#0b0d14;margin-bottom:18px">V</div><div style="font-size:15px;font-weight:600;margin-bottom:8px">后端服务未响应</div><div style="font-size:13px;color:#8b93a7;margin-bottom:20px;text-align:center;line-height:1.7;max-width:340px">正在自动重连并尝试重启后端，恢复后本页会自动刷新。<br>如果你刚触发了更新，这是正常的。</div><div style="width:180px;height:4px;border-radius:99px;background:rgba(255,255,255,0.08);overflow:hidden"><div style="width:35%;height:100%;border-radius:99px;background:linear-gradient(90deg,#3ad0c8,#8b7bf0);animation:__vt_slide 1.1s ease-in-out infinite"></div></div><div id="__vt_overlay_actions" style="display:none;gap:8px;margin-top:22px"><button id="__vt_btn_restart" style="background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.14);color:#f3f5fb;font-size:12px;padding:7px 14px;border-radius:8px;cursor:pointer;font-family:inherit">重启后端</button><button id="__vt_btn_reload" style="background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.14);color:#f3f5fb;font-size:12px;padding:7px 14px;border-radius:8px;cursor:pointer;font-family:inherit">刷新界面</button><button id="__vt_btn_dismiss" style="background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.14);color:#f3f5fb;font-size:12px;padding:7px 14px;border-radius:8px;cursor:pointer;font-family:inherit">关闭提示</button></div><style>@keyframes __vt_slide{0%{margin-left:-35%}100%{margin-left:100%}}</style>';
+  var api=(window.go&&window.go.main&&window.go.main.App)||null;
+  d.querySelector('#__vt_btn_restart').onclick=function(){ if(api&&api.RestartBackend) api.RestartBackend(); };
+  d.querySelector('#__vt_btn_reload').onclick=function(){
+    if(window.__vtlReloadApp) window.__vtlReloadApp(); else window.location.reload();
+  };
+  d.querySelector('#__vt_btn_dismiss').onclick=function(){ if(d.parentNode) d.parentNode.removeChild(d); };
+  // 按钮延后 10s 露出：短暂中断（更新重启）本来就会自愈，一上来就摆三颗
+  // 按钮反而像出了大事。真卡住的才需要逃生口。
+  setTimeout(function(){
+    var acts=d.querySelector('#__vt_overlay_actions');
+    if(acts) acts.style.display='flex';
+  },10000);
   document.body.appendChild(d);
 })();`
 

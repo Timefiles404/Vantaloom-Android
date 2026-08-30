@@ -526,8 +526,15 @@
         }
       });
 
-      // 后端更新完成后由壳注入调用：只刷 iframe，不动本页。
+      // 后端恢复后由壳注入调用：只刷 iframe，不动本页。
+      //
+      // ⚠️ 正因为「只刷 iframe」，它清不掉壳注入在**本页** body 上的断连覆盖层
+      // （#__vt_update_overlay）——那个覆盖层曾经只有「加」没有「减」，一旦弹出
+      // 就永久糊在画面上，用户只能关窗重开。壳侧现在会显式拆它，这里再兜一道：
+      // 任何走到「刷新应用」的路径都必须顺手把它带走。
       window.__vtlReloadApp = () => {
+        const overlay = document.getElementById("__vt_update_overlay");
+        if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
         const frame = $("appframe");
         if (frame && frame.src) frame.src = frame.src;
         else window.location.reload();

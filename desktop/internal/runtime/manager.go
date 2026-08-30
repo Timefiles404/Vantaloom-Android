@@ -582,11 +582,23 @@ func (m *Manager) runCtl(ctx context.Context, args ...string) error {
 	return nil
 }
 
+// killTrayTimeout 给收尸命令（taskkill / pkill）一个上界。
+//
+// 它们是**外部进程**：自己卡住（系统忙、目标正处在不可中断的内核态）就等于 killTray
+// 没有上界。而 killTray 蹲在安装/更新的关键路径上——它的存在就是为了让接下来那步
+// 覆盖 bin/ 能拿到文件锁——用户看到的会是壳卡在「正在更新」，一个连日志都没有的死等。
+// 到点由 CommandContext 杀掉收尸命令本身，让更新流程继续往下走（真没杀掉的话，随后
+// 的文件覆盖会自己报错，那是一条有话说的失败）。
+// 与 apps/api 的 plugins/mcpruntime/proc_windows.go 同一套形状。
+const killTrayTimeout = 5 * time.Second
+
 // killTray stops a lingering tray process that may hold locks on bin/ (older
 // trays don't write a pid that vantaloomctl stop can find). Best-effort.
 func (m *Manager) killTray() {
+	ctx, cancel := context.WithTimeout(context.Background(), killTrayTimeout)
+	defer cancel()
 	if runtime.GOOS != "windows" {
-		kill := exec.Command("pkill", "-f", "vantaloom-tray")
+		kill := exec.CommandContext(ctx, "pkill", "-f", "vantaloom-tray")
 		winproc.Hide(kill) // no-op on non-windows
 		_ = kill.Run()
 		return
@@ -597,7 +609,7 @@ func (m *Manager) killTray() {
 		return
 	}
 	if pid := strings.TrimSpace(string(b)); pid != "" {
-		kill := exec.Command("taskkill", "/PID", pid, "/F")
+		kill := exec.CommandContext(ctx, "taskkill", "/PID", pid, "/F")
 		winproc.Hide(kill)
 		_ = kill.Run()
 		_ = os.Remove(pidFile)

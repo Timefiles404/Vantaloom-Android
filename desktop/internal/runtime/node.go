@@ -101,7 +101,11 @@ func workingNodeInDir(dir string) string {
 func nodeRuns(nodePath string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return exec.CommandContext(ctx, nodePath, "--version").Run() == nil
+	cmd := exec.CommandContext(ctx, nodePath, "--version")
+	// node.exe 是控制台子系统程序：不 Hide 就是一次探测闪一个黑框，而这条探测在
+	// 壳启动时对每个候选目录都会跑一遍。与 apps/api/internal/nodeenv 同源同修。
+	winproc.Hide(cmd)
+	return cmd.Run() == nil
 }
 
 // nodeExePath returns the node executable in a managed-dir layout
