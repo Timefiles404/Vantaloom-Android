@@ -424,7 +424,9 @@ func (d *relayDialer) Explain(_ context.Context, peerID string) (bool, string) {
 		return false, "账号「连接偏好」已关闭服务器中继。"
 	}
 	rc := d.n.opts.RelayConfig
-	if rc == nil || rc.QuicAddr == "" {
+	// 判据是「有任一坐标」而不是「有 QUIC 坐标」：官方 Hub 是 WSS-only 启用的，
+	// 而 relayClient 本来就会在没有 QUIC 时直接走 WSS（见 RelayConfig.HasCoordinate）。
+	if !rc.HasCoordinate() {
 		return false, "中继未启用（未配置中继坐标）。中继是 TURN 式密文包转发器，用于直连/公网直连均不可用时的兜底连接方式。"
 	}
 	fp, _, ok := d.n.opts.Directory.PeerInfo(peerID)
@@ -439,7 +441,7 @@ func (d *relayDialer) Explain(_ context.Context, peerID string) (bool, string) {
 
 func (d *relayDialer) Dial(ctx context.Context, peerID string) (Session, error) {
 	rc := d.n.opts.RelayConfig
-	if rc == nil || rc.QuicAddr == "" {
+	if !rc.HasCoordinate() {
 		return nil, errors.New("loomnet: relay: 中继未配置")
 	}
 	fp, _, ok := d.n.opts.Directory.PeerInfo(peerID)

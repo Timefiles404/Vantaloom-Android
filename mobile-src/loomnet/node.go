@@ -146,6 +146,23 @@ func (p *ConnectionPrefs) SyncModelsEnabled() bool {
 	return p == nil || p.SyncModels == nil || *p.SyncModels
 }
 
+// HasCoordinate 报告这份配置里有没有**任何**一个可用的中继坐标。
+//
+// 两个坐标是同一件事的两条路，relayClient.connectWithFallback 一直是「QuicAddr
+// 优先，没配/连不上就走 WSSUrl」——所以「中继可不可用」的判据必须是两者取或，
+// 不能只看 QuicAddr。
+//
+// 只看 QuicAddr 曾让**账号内中继在生产上从未存在过**：官方 Hub 是 WSS-only 启用
+// 的（服务器 ~/hub/.loom-relay-wss-url，走 Cloudflare Tunnel 的 443，不需要放行
+// 任何 UDP），/api/overlay/rendezvous 实测只回 wssUrl、没有 quicAddr。于是
+// rendezvousDialer（判据本来就是两者取或）照常注册、临时连接可用，而 relayDialer
+// 与 ensureServeRelay 全被 QuicAddr=="" 挡死 ⇒ 跨网段的两台机器梯队走完只剩四条
+// 失败原因，连接报告里连「中继」这一档都不出现。线上实锤：2026-08-31 的用户诊断
+// 包里，直连/公网直连/反向/会合四条全灭 → 502，而中继本该正是这一格的兜底。
+func (rc *RelayConfig) HasCoordinate() bool {
+	return rc != nil && (rc.QuicAddr != "" || rc.WSSUrl != "")
+}
+
 // Fingerprint 返回中继配置的确定性指纹（坐标 + JWT + SPKI + STUN 观测点），用于
 // 检测配置变化（Hub 换中继地址、JWT 轮换、中继重启换自签证书等）——relayClient
 // 懒单例据此 close 旧 client 并重建。nil → ""。JWT 只进 sha256 哈希、绝不进日志
@@ -448,11 +465,13 @@ func (n *Node) applyRelayConfig() {
 		// 之前——打洞失败自动降级中继。
 		n.Registry.Register(&punchDialer{n: n})
 	}
-	if rc.QuicAddr != "" && n.relayDialerRegistered.CompareAndSwap(false, true) {
+	if rc.HasCoordinate() && n.relayDialerRegistered.CompareAndSwap(false, true) {
 		// 中继（TURN 式密文包转发）：Priority 40，在所有直连方式之后尝试。
+		// 判据是 HasCoordinate（QUIC 或 WSS 任一），与下面的会合同口径——官方
+		// Hub 是 WSS-only 的，只看 QuicAddr 等于让账号内中继永不注册。
 		n.Registry.Register(&relayDialer{n: n})
 	}
-	if (rc.QuicAddr != "" || rc.WSSUrl != "") && n.rzRegistered.CompareAndSwap(false, true) {
+	if rc.HasCoordinate() && n.rzRegistered.CompareAndSwap(false, true) {
 		// 临时连接会合：Priority 50，梯队最后一级。坐标可用即注册——它不依赖
 		// JWT，未登录 Hub 的机器正是它服务的对象。
 		n.Registry.Register(&rendezvousDialer{n: n})
@@ -467,7 +486,9 @@ func (n *Node) applyRelayConfig() {
 // （无 data race）。node 未启动时静默跳过，由 Start 尾部 applyRelayConfig
 // 补启动。
 func (n *Node) ensureServeRelay(rc *RelayConfig) {
-	if rc == nil || rc.QuicAddr == "" {
+	// 判据同注册门：WSS-only 的 Hub 上 B 侧也必须常驻，否则本机拨得出去、却
+	// 永远收不到别人经中继拨过来的 INCOMING（单向可用比全不可用更难查）。
+	if !rc.HasCoordinate() {
 		return
 	}
 	if !n.started.Load() {
